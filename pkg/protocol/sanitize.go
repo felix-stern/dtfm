@@ -108,19 +108,27 @@ func escapeRune(b *strings.Builder, r rune) {
 	}
 }
 
-// isBidiOverride checks for Unicode bidirectional override characters.
-func isBidiOverride(r rune) bool {
+// IsBidiOverride checks for Unicode bidirectional override characters.
+func IsBidiOverride(r rune) bool {
 	return (r >= 0x202A && r <= 0x202E) || (r >= 0x2066 && r <= 0x2069) || r == 0x200E || r == 0x200F
 }
 
-// needsEscape returns true if rune r requires escaping to be safely displayed on a terminal.
+func isBidiOverride(r rune) bool {
+	return IsBidiOverride(r)
+}
+
+// NeedsEscape returns true if rune r requires escaping to be safely displayed on a terminal.
 // Explicit checks for control codes, NBSP, bidirectional overrides, combining marks,
 // formatting/variation selectors, and invisible blank fillers prevent visual spoofing.
-func needsEscape(r rune) bool {
-	return r < 32 || r == 127 || r == 0x00A0 || isBidiOverride(r) || !unicode.IsPrint(r) ||
+func NeedsEscape(r rune) bool {
+	return r < 32 || r == 127 || r == 0x00A0 || IsBidiOverride(r) || !unicode.IsPrint(r) ||
 		unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Me, r) || unicode.Is(unicode.Cf, r) ||
 		(r >= 0xFE00 && r <= 0xFE0F) || (r >= 0xE0100 && r <= 0xE01EF) ||
 		r == 0x034F || r == 0x115F || r == 0x1160 || r == 0x2800 || r == 0x3164 || r == 0xFFA0
+}
+
+func needsEscape(r rune) bool {
+	return NeedsEscape(r)
 }
 
 // SanitizeTerminalText makes arbitrary text safe to print to an operator's terminal
@@ -197,8 +205,16 @@ func ShellQuote(arg string) string {
 				b.WriteString(`\\`)
 			} else if r == '\x1b' || r == '\n' || r == '\r' || r == '\t' || r == '\a' || r == '\b' || r == '\v' || r == '\f' {
 				escapeRune(&b, r)
-			} else if needsEscape(r) {
-				escapeRune(&b, r)
+			} else if NeedsEscape(r) {
+				if r >= 0x80 {
+					var buf [utf8.UTFMax]byte
+					n := utf8.EncodeRune(buf[:], r)
+					for j := 0; j < n; j++ {
+						fmt.Fprintf(&b, `\x%02x`, buf[j])
+					}
+				} else {
+					escapeRune(&b, r)
+				}
 			} else {
 				b.WriteRune(r)
 			}
@@ -209,6 +225,34 @@ func ShellQuote(arg string) string {
 
 	// Standard POSIX single-quote format
 	return "'" + strings.ReplaceAll(arg, "'", `'\''`) + "'"
+}
+
+// SanitizeBannerCommand sanitizes text printed in the execution banner (e.g. opts.ModifiedCommand)
+// by escaping control characters, bidi overrides, C1 controls, invisible runes, and formatting characters
+// to prevent terminal manipulation, while preserving normal backslashes and printable characters.
+func SanitizeBannerCommand(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			fmt.Fprintf(&b, `\x%02x`, s[i])
+			i++
+			continue
+		}
+		i += size
+
+		switch {
+		case r == '\\':
+			b.WriteRune('\\')
+		case r == '\x1b' || r == '\n' || r == '\r' || r == '\t' || r == '\a' || r == '\b' || r == '\v' || r == '\f':
+			escapeRune(&b, r)
+		case NeedsEscape(r):
+			escapeRune(&b, r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // FormatCommand formats a command and its arguments into an unambiguous, lossless shell string.

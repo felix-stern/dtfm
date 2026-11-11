@@ -123,7 +123,11 @@ func (e *CommandExecutor) ActiveChildPid() int {
 // Execute runs the approved binary directly with context timeout, terminal foreground control,
 // process group termination, and safe environment inheritance.
 func (e *CommandExecutor) Execute(ctx context.Context, opts ExecOptions) protocol.CommandResponse {
-	fmt.Fprintf(e.out, "⚡ Executing: %s\n", protocol.FormatCommand(opts.Command, opts.Args))
+	if opts.ModifiedCommand != "" {
+		fmt.Fprintf(e.out, "⚡ Executing (edited): %s\n", protocol.SanitizeBannerCommand(opts.ModifiedCommand))
+	} else {
+		fmt.Fprintf(e.out, "⚡ Executing: %s\n", protocol.FormatCommand(opts.Command, opts.Args))
+	}
 
 	cmd := exec.CommandContext(ctx, opts.Command, opts.Args...)
 	if opts.Cwd != "" {
@@ -157,7 +161,9 @@ func (e *CommandExecutor) Execute(ctx context.Context, opts ExecOptions) protoco
 					// BEFORE cmd.Start() is called. This prevents race conditions where child programs
 					// (e.g. sudo or ssh) disable ECHO for password prompts and subsequent disableSusp calls
 					// overwrite the child's termios back to +echo.
+					signal.Ignore(syscall.SIGTTOU, syscall.SIGTTIN)
 					disableSusp(ttyFile.Fd(), origTermios)
+					signal.Reset(syscall.SIGTTOU, syscall.SIGTTIN)
 				}
 			}
 		}
@@ -231,17 +237,18 @@ func (e *CommandExecutor) Execute(ctx context.Context, opts ExecOptions) protoco
 	cmd.Stdout = io.MultiWriter(e.out, stdoutBuf)
 	cmd.Stderr = io.MultiWriter(e.errOut, stderrBuf)
 
-	if err := cmd.Start(); err != nil {
+	startErr := cmd.Start()
+	if startErr != nil {
 		duration := time.Since(opts.StartTime).Milliseconds()
 		fmt.Fprintf(e.errOut, "Error starting command %s: %s\n",
 			protocol.SanitizeTerminalText(opts.Command),
-			protocol.SanitizeTerminalText(err.Error()))
+			protocol.SanitizeTerminalText(startErr.Error()))
 		return protocol.CommandResponse{
 			ID:              opts.ID,
 			Status:          protocol.StatusError,
 			ModifiedCommand: opts.ModifiedCommand,
 			ExitCode:        protocol.ExitCodeError,
-			Error:           err.Error(),
+			Error:           startErr.Error(),
 			DurationMs:      duration,
 		}
 	}

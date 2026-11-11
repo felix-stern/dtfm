@@ -166,6 +166,49 @@ func TestShellQuotingAndFormatCommand(t *testing.T) {
 	if protocol.ShellQuote("=rm") != "'=rm'" {
 		t.Errorf("Expected leading '=' to be quoted, got %s", protocol.ShellQuote("=rm"))
 	}
+
+	// Verify non-ASCII runes needing escape (e.g. NBSP U+00A0, bidi override U+202E) use UTF-8 \xNN escapes in $'...'
+	// for macOS Bash 3.2 compatibility
+	quotedNBSP := protocol.ShellQuote("hello\u00a0world")
+	expectedNBSP := `$'hello\xc2\xa0world'`
+	if quotedNBSP != expectedNBSP {
+		t.Errorf("ShellQuote with NBSP failed: expected %s, got %s", expectedNBSP, quotedNBSP)
+	}
+
+	quotedBidi := protocol.ShellQuote("safe\u202ereversed")
+	expectedBidi := `$'safe\xe2\x80\xaereversed'`
+	if quotedBidi != expectedBidi {
+		t.Errorf("ShellQuote with bidi override failed: expected %s, got %s", expectedBidi, quotedBidi)
+	}
+}
+
+func TestSanitizeBannerCommand(t *testing.T) {
+	// 1. Normal command preserved without escaping backslashes
+	cmd := `echo 'hello\nworld' && grep \b /tmp`
+	if sanitized := protocol.SanitizeBannerCommand(cmd); sanitized != cmd {
+		t.Fatalf("Expected %q, got %q", cmd, sanitized)
+	}
+
+	// 2. Control characters (< 32, 127) and ANSI escapes are escaped
+	malicious := "echo ok\r\x1b[2Krm -rf /\x07"
+	expected := `echo ok\r\x1b[2Krm -rf /\a`
+	if sanitized := protocol.SanitizeBannerCommand(malicious); sanitized != expected {
+		t.Fatalf("Expected %q, got %q", expected, sanitized)
+	}
+
+	// 3. Bidi override escaped
+	bidi := "safe\u202ereversed"
+	expectedBidi := `safe\u202ereversed`
+	if sanitized := protocol.SanitizeBannerCommand(bidi); sanitized != expectedBidi {
+		t.Fatalf("Expected %q, got %q", expectedBidi, sanitized)
+	}
+
+	// 4. C1 control U+009B (8-bit CSI), line separator U+2028, and zero-width space U+200B
+	c1Payload := "echo \u009b2Jevil\u2028newline\u200bhidden\\slash"
+	expectedC1 := `echo \u009b2Jevil\u2028newline\u200bhidden\slash`
+	if sanitized := protocol.SanitizeBannerCommand(c1Payload); sanitized != expectedC1 {
+		t.Fatalf("Expected %q, got %q", expectedC1, sanitized)
+	}
 }
 
 func TestSanitizeEnvSecurity(t *testing.T) {
