@@ -32,6 +32,9 @@ sequenceDiagram
 - **Bounded Resources**: Stream messages capped at 4 MB; subprocess output buffers bounded to 1 MB.
 - **Process Isolation**: Grandchild processes run in dedicated process groups and terminate on timeout or cancellation (`SIGKILL`).
 
+> [!IMPORTANT]
+> **Trust Model**: `dtfm` is a human-in-the-loop safety gate ("seatbelt") designed to prevent accidental misuse or unintended commands from AI agents in environments you control. Approved commands run **unsandboxed** with your local user privileges, and terminal sanitization is best-effort — **do not** expose or forward the `dtfm` socket to untrusted hosts or third parties, and always review commands before approving.
+
 ---
 
 ## Installation & Build
@@ -39,8 +42,8 @@ sequenceDiagram
 ### Prebuilt Binaries
 Hermetic static binaries are available on [GitHub Releases](https://github.com/iinozemtsev-lab/dtfm/releases) for `darwin-arm64`, `darwin-amd64`, `linux-amd64`, and `linux-arm64`:
 ```bash
-curl -fLO https://github.com/iinozemtsev-lab/dtfm/releases/download/v0.1.0/dtfm_0.1.0_linux_amd64.tar.gz
-tar -xzf dtfm_0.1.0_linux_amd64.tar.gz && sudo install -m 0755 dtfm lmdtfy /usr/local/bin/
+curl -fLO https://github.com/iinozemtsev-lab/dtfm/releases/download/v0.2.0/dtfm_0.2.0_linux_amd64.tar.gz
+tar -xzf dtfm_0.2.0_linux_amd64.tar.gz && sudo install -m 0755 dtfm lmdtfy /usr/local/bin/
 ```
 
 ### Build from Source (Go 1.22+)
@@ -108,8 +111,9 @@ lmdtfy exec --why "Run test suite" --cwd /opt/project --timeout 120 pytest
 
 ---
 
-## Releases & Changelog
+## Documentation & Releases
 
+- Agent onboarding manual: [docs/lmdtfy_guide.md](docs/lmdtfy_guide.md)
 - Maintainer release procedures: [docs/releasing.md](docs/releasing.md)
 - Release history and notes: [CHANGELOG.md](CHANGELOG.md)
 

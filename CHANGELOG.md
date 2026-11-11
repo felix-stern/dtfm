@@ -7,7 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-11
+
 ### Added
+- Agent onboarding manual (`docs/lmdtfy_guide.md`) providing 1-line installation, gateway discovery (`lmdtfy ping`), execution instructions (`lmdtfy exec --why`), and deterministic POSIX exit code error-handling rules for autonomous coding agents ([#10](https://github.com/iinozemtsev-lab/dtfm/issues/10)).
 - Manual release dispatch support (`workflow_dispatch`) in `.github/workflows/release.yml` with strict SemVer validation, `main` branch and ancestry verification, fail-closed existing-tag/release collision guards, automated Git tag creation on release publish, and single-step release creation ([#6](https://github.com/iinozemtsev-lab/dtfm/issues/6)).
 - GitHub Actions CI workflow (`.github/workflows/ci.yml`) validating formatting, `go vet`, multi-OS unit/race tests (`ubuntu-latest`, `macos-latest`), and static cross-compilation targets ([#3](https://github.com/iinozemtsev-lab/dtfm/issues/3)).
 - Automated GitHub Releases workflow (`.github/workflows/release.yml`) triggering on semver git tags (`v*`), compiling hermetic stripped static binaries (`CGO_ENABLED=0`), packaging multi-architecture tarballs with documentation and license, computing cryptographic `SHA256SUMS`, and publishing assets with automated release notes ([#3](https://github.com/iinozemtsev-lab/dtfm/issues/3)).
@@ -42,5 +45,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Build Infrastructure**:
   - Multi-platform static compilation targets in `Makefile` (`make cross`) for `darwin-arm64`, `darwin-amd64`, `linux-amd64`, and `linux-arm64` (`CGO_ENABLED=0`).
 
-[Unreleased]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/iinozemtsev-lab/dtfm/releases/tag/v0.1.0
+[Unreleased]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/iinozemtsev-lab/dtfm/compare/6d8f9d2...v0.2.0
+[0.1.0]: https://github.com/iinozemtsev-lab/dtfm/commit/6d8f9d2
