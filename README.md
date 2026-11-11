@@ -3,10 +3,8 @@
 **Teleport your agent. Instantly. Precisely.**  
 *Execute commands on your machine or servers from sandboxed AI agents — without sharing your credentials.*
 
-Human-in-the-loop (HITL) execution gateway and CLI dispatcher for autonomous AI agents and remote engineers:
-
-- `dtfm` (*Do That For Me*) runs on the operator's workstation, listening on a secure Unix domain socket and prompting the operator for approval before executing commands.
-- `lmdtfy` (*Let Me Do That For You*) runs inside the agent's environment (local container, VM, or remote server over SSH), dispatching commands to `dtfm` with an explicit reason (`--why`).
+- `dtfm` (*Do That For Me*) runs on your workstation or target host, listening over a local Unix socket or end-to-end encrypted (E2EE) WebSocket relay and prompting you for approval before running any command.
+- `lmdtfy` (*Let Me Do That For You*) runs inside the agent's environment (SSH-reachable VM, local container, or cloud sandbox), dispatching commands to `dtfm` with an explicit reason (`--why`).
 
 ---
 
@@ -14,67 +12,30 @@ Human-in-the-loop (HITL) execution gateway and CLI dispatcher for autonomous AI 
 
 Autonomous AI coding agents work best when they can run tools, test commands, and inspect environments directly. However, giving an agent full shell access or copying master credentials into an agent container creates severe security and operational friction. `dtfm` bridges this boundary with human-in-the-loop verification across three concrete developer scenarios:
 
-- **Keep secrets out of agent sandboxes (The Cloud CLI Dilemma)**: Workstations hold master cloud credentials (`gcloud`, `aws`, `kubectl`, `1Password`, `gh`), while AI agents run in sandboxes (Docker, VMs, Codespaces). Copying credentials into the sandbox is dangerous; manual copy-pasting breaks agent flow. `dtfm` allows the agent to run `lmdtfy exec --why ...`, executing on the host with 1-click approval (`[y]`) and zero leaked tokens.
-- **Supervised driving on remote servers ("Tool Proxy / Admin Session")**: Tweaking a remote VPS (Nginx, systemd, firewall). The agent does the heavy typing and thinking, but the human keeps a foot on the brake via `[y] Run / [e] Edit / [n] Reject` rather than giving an LLM unchecked root/sudo SSH access.
-- **Zero-trust remote pairing & assistance**: Assisting a peer or family member with terminal tasks with per-command confirmation instead of clumsy screen-sharing or wide-open SSH.
-
----
-
-## Architecture
-
-```mermaid
-sequenceDiagram
-    participant LMDTFY as lmdtfy (Agent / Remote)
-    participant DTFM as dtfm (Workstation)
-    actor Operator as Operator (/dev/tty)
-
-    LMDTFY->>DTFM: ExecRequest(why, cmd, args, cwd) via Unix socket or ssh -R
-    DTFM->>Operator: Prompt approval: [y] Run / [e] Edit / [n] Reject
-    Operator-->>DTFM: Keypress (y / e / n)
-    alt Approved
-        DTFM->>DTFM: Run in dedicated process group
-        DTFM-->>LMDTFY: Stream stdout / stderr
-        DTFM->>LMDTFY: ExecResponse(exit_code)
-    else Rejected / Stale Keystroke / Timeout
-        DTFM->>LMDTFY: ExecResponse(exit_code: 126 / 124)
-    end
-```
-
-- **Interactive Approvals**: Requests are displayed in POSIX shell syntax with stripped terminal control escapes and Trojan Source bidi characters.
-- **Fail-Closed Security**: Dead stdin/EOF, stale keystrokes, and closed client connections immediately reject execution (exit code `126`). Custom environment variables are rejected upfront (`LD_*`, `PATH`, etc.).
-- **Bounded Resources**: Stream messages capped at 4 MB; subprocess output buffers bounded to 1 MB.
-- **Process Isolation**: Grandchild processes run in dedicated process groups and terminate on timeout or cancellation (`SIGKILL`).
-
-> [!IMPORTANT]
-> **Trust Model**: `dtfm` is a human-in-the-loop safety gate ("seatbelt") designed to prevent accidental misuse or unintended commands from AI agents in environments you control. Approved commands run **unsandboxed** with your local user privileges, and terminal sanitization is best-effort — **do not** expose or forward the `dtfm` socket to untrusted hosts or third parties, and always review commands before approving.
-
----
-
-## Installation & Build
-
-### Prebuilt Binaries
-Hermetic static binaries are available on [GitHub Releases](https://github.com/iinozemtsev-lab/dtfm/releases) for `darwin-arm64`, `darwin-amd64`, `linux-amd64`, and `linux-arm64`:
-```bash
-curl -fLO https://github.com/iinozemtsev-lab/dtfm/releases/download/v0.2.0/dtfm_0.2.0_linux_amd64.tar.gz
-mkdir -p ~/.local/bin
-tar -xzf dtfm_0.2.0_linux_amd64.tar.gz dtfm lmdtfy
-install -m 0755 dtfm lmdtfy ~/.local/bin/ && rm -f dtfm lmdtfy dtfm_0.2.0_linux_amd64.tar.gz
-```
-
-*(Ensure `~/.local/bin` is in your `$PATH`.)*
-
-### Build from Source (Go 1.22+)
-```bash
-make        # Build local binaries in bin/
-make test   # Run unit tests with race detection
-make cross  # Cross-compile release binaries
-```
+- **Keep secrets out of agent sandboxes**: Workstations hold master cloud credentials (`gcloud`, `aws`, `kubectl`, `1Password`, `gh`), while AI agents run in sandboxes (Docker, VMs, Codespaces). Copying credentials into the sandbox is dangerous; manual copy-pasting breaks agent flow. `dtfm` lets the agent run `lmdtfy exec --why ...`, executing on the host after explicit terminal approval (`[y]`) with zero leaked tokens.
+- **Supervised driving on remote servers**: Configure or debug a remote VPS (Nginx, systemd, firewall) with `dtfm` running in your SSH session — the agent does the heavy typing and diagnostics while you keep a foot on the brake via `[y] Run / [e] Edit / [n] Reject` rather than granting an LLM unchecked root or `sudo` access.
+- **Zero-trust remote pairing & assistance**: Assist a peer or family member on terminal tasks with per-command confirmation instead of clumsy screen-sharing or wide-open SSH.
 
 ---
 
 ## Quickstart
 
-### 1. Operator: Start Approval Listener
+### 1. Operator: Install & Start Approval Listener
+
+Install the static `dtfm` binary into `~/.local/bin` (Linux & macOS, `amd64` & `arm64`):
+
+```bash
+os=$(uname -s | tr '[:upper:]' '[:lower:]')
+arch=$(uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
+tmp=$(mktemp) && mkdir -p ~/.local/bin && \
+  curl -fsSL "https://github.com/iinozemtsev-lab/dtfm/releases/latest/download/dtfm-${os}-${arch}" -o "$tmp" && \
+  install -m 0755 "$tmp" ~/.local/bin/dtfm && rm -f "$tmp"
+```
+
+*(Ensure `~/.local/bin` is in your `$PATH`, or [build from source](#build-from-source-go-122) below.)*
+
+Start the approval listener on your workstation:
+
 ```bash
 # Listen on default socket (/run/user/<uid>/lmdtfy.sock on Linux, ~/.lmdtfy.sock on macOS)
 dtfm
@@ -98,14 +59,14 @@ dtfm ssh-config ubuntu@agent-vm --write
 ssh agent-vm
 ```
 
-*(Or ad-hoc without editing `~/.ssh/config`: `ssh -R /run/user/<remote_uid>/lmdtfy.sock:<local_socket> ubuntu@agent-vm`)*
+*(Or ad-hoc without editing `~/.ssh/config`: `ssh -o StreamLocalBindUnlink=yes -R /run/user/<remote_uid>/lmdtfy.sock:<local_socket> ubuntu@agent-vm`)*
 
 </details>
 
 <details>
 <summary><b>Same Machine or Local Container</b> — shared local Unix socket</summary>
 
-`lmdtfy` connects automatically to the default local socket path (for containers, bind-mount the socket and set `LMDTFY_SOCKET` if UIDs differ).
+`lmdtfy` connects automatically to the default local socket path (for containers, bind-mount the socket — e.g. to `/run/lmdtfy.sock` — and set `LMDTFY_SOCKET`; on Linux, match the host UID or run as root).
 
 </details>
 
@@ -115,8 +76,8 @@ ssh agent-vm
 Bridge across NATs without inbound SSH using the included zero-knowledge E2EE `relay` server:
 
 ```bash
-# 1. Run the stateless in-memory relay on any HTTPS/WSS endpoint:
-relay --listen 127.0.0.1:8080
+# 1. Run the stateless in-memory relay behind any HTTPS/WSS endpoint (default listen: :8088):
+relay --listen 127.0.0.1:8088
 
 # 2. Operator connects to the relay (prints E2EE pairing token and Magic Link):
 dtfm --relay --relay-url wss://<relay-host>/ws
@@ -128,7 +89,17 @@ lmdtfy exec --relay "https://<relay-host>/c/<session-id>#<key>" --why "run migra
 
 </details>
 
-### 3. Agent: Check Connectivity & Execute
+### 3. Hand Off to Your Agent
+
+Paste this into your agent's chat (it will install `lmdtfy` if needed and verify connectivity):
+
+```text
+I have dtfm running. Read https://raw.githubusercontent.com/iinozemtsev-lab/dtfm/main/docs/lmdtfy_guide.md, install lmdtfy if needed, ping me to verify the connection, and route any privileged or host commands through it.
+```
+
+<details>
+<summary><b>Or run <code>lmdtfy</code> directly from a shell</b></summary>
+
 ```bash
 # Verify connection to active operator session (exit code 0 if ready, 2 if inactive)
 lmdtfy ping
@@ -136,8 +107,64 @@ lmdtfy ping
 # Dispatch command for human review and execution
 lmdtfy exec --why "Install project dependencies" npm install
 
-# Custom working directory or review timeout (seconds)
+# Custom working directory or review/execution timeout (seconds)
 lmdtfy exec --why "Run test suite" --cwd /opt/project --timeout 120 pytest
+```
+
+</details>
+
+When your agent dispatches a command, `dtfm` prompts on your terminal before anything runs:
+
+```text
+────────────────────────────────────────────────────────────
+🔔 LMDTFY Command Execution Request:
+   Reason:  Deploy staging worker
+   Command: gcloud run deploy worker --region europe-west6
+────────────────────────────────────────────────────────────
+Approve execution? [y] Run  [e] Edit  [n] Reject:
+```
+
+---
+
+## Architecture
+
+```mermaid
+sequenceDiagram
+    participant LMDTFY as lmdtfy (Agent / Remote)
+    participant DTFM as dtfm (Workstation)
+    actor Operator as Operator (/dev/tty)
+
+    LMDTFY->>DTFM: ExecRequest(why, cmd, args, cwd) via Unix socket, ssh -R, or E2EE relay
+    DTFM->>Operator: Prompt approval: [y] Run / [e] Edit / [n] Reject
+    Operator-->>DTFM: Decision (y / e / n + Enter)
+    alt Approved or Edited
+        DTFM->>Operator: Run in isolated process group (live terminal output)
+        DTFM->>LMDTFY: ExecResponse(exit_code, captured stdout/stderr)
+    else Rejected / Disconnected / Timeout
+        DTFM->>LMDTFY: ExecResponse(exit_code: 126 / 124)
+    end
+```
+
+- **Interactive Approvals & Inline Editing**: Requests are displayed in lossless POSIX / ANSI-C (`$'...'`) shell syntax with visibly escaped terminal control codes and Trojan Source bidi characters. Operators can edit commands inline with Readline-style keybindings (`[e]`) before running, and pending TTY input is flushed prior to prompting so pre-typed keystrokes cannot auto-approve requests.
+- **Fail-Closed Security**: Dead stdin/EOF, backgrounded TTYs, TTY input-flush errors, and closed client connections immediately reject execution (exit code `126`). Any custom environment variables are rejected upfront (e.g., `LD_*`, `PATH`).
+- **Bounded Resources**: Request frames are capped at 4 MiB; captured `stdout` and `stderr` are bounded to 1 MiB per stream (16 MiB max serialized response envelope).
+- **Process Isolation**: Child and grandchild processes run in dedicated process groups and terminate on timeout or cancellation (`SIGKILL`).
+
+> [!IMPORTANT]
+> **Trust Model**: `dtfm` is a human-in-the-loop safety gate ("seatbelt") designed to prevent accidental misuse or unintended commands from AI agents in environments you control. Approved commands run **unsandboxed** with your local user privileges, and terminal sanitization is best-effort — **do not** expose or forward the `dtfm` socket (or share relay pairing links) with untrusted hosts or third parties, and always review commands before approving.
+
+---
+
+## Installation & Build
+
+### Prebuilt Release Archives
+Standalone static binaries and reproducible `.tar.gz` archives (`dtfm`, `lmdtfy`, and `relay`) with `SHA256SUMS` are published on [GitHub Releases](https://github.com/iinozemtsev-lab/dtfm/releases) for `darwin-arm64`, `darwin-amd64`, `linux-amd64`, and `linux-arm64`.
+
+### Build from Source (Go 1.22+)
+```bash
+make build  # Build local static binaries in bin/
+make test   # Run unit tests (-race) and script checks
+make cross  # Cross-compile release binaries in bin/dist/
 ```
 
 ---
@@ -145,28 +172,31 @@ lmdtfy exec --why "Run test suite" --cwd /opt/project --timeout 120 pytest
 ## CLI Reference
 
 - `dtfm [--socket <path>]`: Start approval server on default socket (or specified path).
-- `dtfm --relay [--relay-url <url>] [--hub-url <url>] [--session <id>]`: Start in-memory E2EE WebSocket relay session.
+- `dtfm --relay [--relay-url <url>] [--hub-url <url>] [--session <id>]`: Start in-memory E2EE WebSocket relay session (`--relay-url` required when self-hosting).
 - `dtfm ssh-config <host> [-w|--write] [--socket <path>] [--config <path>]`: Generate or atomically write `~/.ssh/config` `RemoteForward` block.
 - `lmdtfy ping [--socket <path>] [--relay <token-or-url>] [--relay-url <url>]`: Test operator listener connectivity.
-- `lmdtfy exec --why "<reason>" [--socket <path>] [--relay <token-or-url>] [--relay-url <url>] [--timeout <sec>] [--cwd <path>] <cmd>...`: Dispatch command for human review.
-- `relay [--listen <addr>] [--idle-timeout <dur>] [--max-sessions <n>] [--max-sessions-per-ip <n>] [--trusted-proxies <cidrs>]`: Standalone in-memory WebSocket streaming relay server (`cmd/relay`).
-- `dtfm --version` / `lmdtfy --version`: Display version information.
+- `lmdtfy exec --why "<reason>" [--socket <path>] [--relay <token-or-url>] [--relay-url <url>] [--timeout <sec>] [--cwd <path>] <cmd>...`: Dispatch command for human review (`--timeout` defaults to `300` seconds, max `86400`, bounding review and execution separately).
+- `relay [--listen <addr>] [--idle-timeout <dur>] [--max-sessions <n>] [--max-sessions-per-ip <n>] [--trusted-proxies <cidrs>] [--verbose]`: Standalone in-memory WebSocket streaming relay server (`cmd/relay`).
+- `dtfm --version` / `lmdtfy --version` / `relay --version`: Display version information.
 
 ### Environment Variables
 
-| Variable | Description |
-|---|---|
-| `LMDTFY_SOCKET` | Default socket path when `--socket` flag is omitted |
-| `LMDTFY_RELAY` | Default relay token or URL when `--relay` flag is omitted |
-| `LMDTFY_RELAY_URL` | Default relay endpoint URL when `--relay-url` flag is omitted |
+| Variable | Applies To | Description |
+|---|---|---|
+| `LMDTFY_SOCKET` | `dtfm`, `lmdtfy` | Default socket path when `--socket` flag is omitted |
+| `LMDTFY_RELAY` | `lmdtfy` | Default relay token or URL when `--relay` flag is omitted |
+| `LMDTFY_RELAY_URL` | `lmdtfy` | Default relay endpoint URL when `--relay-url` flag is omitted |
+| `NO_COLOR` | `dtfm` | Disable ANSI colors in interactive terminal prompts when non-empty |
 
 ---
 
 ## Exit Codes
 
+Approved commands forward the executed process's exit code (`0–255`) verbatim. Gateway-specific exit codes:
+
 | Code | Meaning |
 |:---:|---|
-| `0` | Success (or exit code of executed command) |
+| `0` | Success (`ping` active, or approved command exited `0`) |
 | `1` | General CLI error or protocol violation |
 | `2` | Session inactive (`dtfm` listener unreachable) |
 | `124` | Execution or review timed out |
