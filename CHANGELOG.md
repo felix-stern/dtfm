@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-11
+
 ### Added
 - Automated changelog finalization on manual `workflow_dispatch` releases via `scripts/finalize-changelog.py`, automatically rotating `[Unreleased]` changes into `## [<VERSION>] - <YYYY-MM-DD>`, updating Keep a Changelog comparison links, committing `chore(release): finalize changelog for <TAG>` to `main` after pre-release quality gates and builds succeed, and bundling the finalized changelog into all distribution archives ([#18](https://github.com/iinozemtsev-lab/dtfm/issues/18)).
 - In-memory streaming WebSocket relay server (`cmd/relay`) with bounded memory budgets, zero persistence, and automatic session idle timeout eviction ([#16](https://github.com/iinozemtsev-lab/dtfm/issues/16)).
@@ -53,6 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Build Infrastructure**:
   - Multi-platform static compilation targets in `Makefile` (`make cross`) for `darwin-arm64`, `darwin-amd64`, `linux-amd64`, and `linux-arm64` (`CGO_ENABLED=0`).
 
-[Unreleased]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/iinozemtsev-lab/dtfm/compare/6d8f9d2...v0.2.0
 [0.1.0]: https://github.com/iinozemtsev-lab/dtfm/commit/6d8f9d2
