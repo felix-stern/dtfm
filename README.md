@@ -216,7 +216,7 @@ lmdtfy --version
 
 This repository adheres to [Semantic Versioning](https://semver.org/) and follows [Keep a Changelog](https://keepachangelog.com/). Releases are fully automated via GitHub Actions (`.github/workflows/release.yml`).
 
-### Step-by-Step Tagging Workflow
+### Step-by-Step Release Workflow
 
 1. **Update `CHANGELOG.md`**:
    - Move completed changes from the `[Unreleased]` section into a new version block:
@@ -231,28 +231,40 @@ This repository adheres to [Semantic Versioning](https://semver.org/) and follow
    - Submit a pull request with the updated `CHANGELOG.md` and any final version bumps.
    - Once approved and merged to `main`, pull the latest `main`.
 
-3. **Tag the Release**:
-   - Create an annotated Git semver tag (prefixed with `v`):
+3. **Trigger the Release**:
+   You can cut and publish the release either manually from GitHub Actions or by pushing a Git tag.
+
+   #### Option A: Manual Workflow Dispatch (Recommended)
+   Trigger the release directly from GitHub Actions without local tag manipulation. The workflow requires running against `refs/heads/main`, validates strict SemVer format (`vMAJOR.MINOR.PATCH` with no leading zeros) upfront, verifies that the target commit is an ancestor of `main`, checks for collisions, and automatically creates the Git tag at the verified `main` commit SHA (`GITHUB_SHA`) upon release publication:
+   - **GitHub Actions Web UI**: Navigate to **Actions** &rarr; **Release** &rarr; **Run workflow**, ensure `Use workflow from: Branch: main` is selected, enter the version tag (e.g. `v0.2.0`), and click **Run workflow**.
+   - **GitHub CLI**:
      ```bash
-     git tag -a v0.2.0 -m "Release v0.2.0"
+     gh workflow run release.yml --ref main -f version=v0.2.0
      ```
 
-4. **Push the Tag**:
-   - Push the tag to upstream:
-     ```bash
-     git push upstream v0.2.0
-     ```
+   #### Option B: Tag Push
+   Alternatively, create an annotated semver tag locally and push it to `upstream` (or `origin` depending on your remote naming):
+   ```bash
+   git tag -a v0.2.0 -m "Release v0.2.0"
+   git push upstream v0.2.0
+   ```
 
-5. **Automated Publishing**:
-   - The `.github/workflows/release.yml` workflow triggers automatically on tag push.
-   - It builds hermetic, stripped static binaries (`CGO_ENABLED=0`, `-trimpath -ldflags="-s -w -X 'main.version=${TAG}'"`) for:
+4. **Automated Publishing & Verification**:
+   The `.github/workflows/release.yml` pipeline automatically:
+   - Validates strict SemVer tag format (`vMAJOR.MINOR.PATCH` with no leading zeros).
+   - Enforces execution against `refs/heads/main` on manual dispatch and verifies commit ancestry on `origin/main`.
+   - Fails closed if a published release already exists or if Git tag collisions are detected.
+   - Runs all pre-release quality gates (`go mod verify`, `gofmt -s`, `go vet`, `go test -race`, and changelog extractor validation).
+   - Extracts release notes from `CHANGELOG.md` corresponding to the target tag (with fallback to automatic GitHub release notes).
+   - Builds hermetic, stripped static binaries (`CGO_ENABLED=0`, `-trimpath -ldflags="-s -w -X 'main.version=${TAG}'"`) for:
      - `darwin/arm64` (Apple Silicon)
      - `darwin/amd64` (macOS Intel)
      - `linux/amd64` (Linux x86_64)
      - `linux/arm64` (Linux ARM64 / aarch64)
+   - Verifies static ELF linkage (no dynamic or interpreter sections) across all Linux binaries.
    - Packages tarball archives (`dtfm_<VERSION>_<OS>_<ARCH>.tar.gz`) containing `dtfm`, `lmdtfy`, `README.md`, `LICENSE`, and `CHANGELOG.md` with reproducible `0:0` ownership and `SOURCE_DATE_EPOCH` timestamps.
-   - Generates cryptographic `SHA256SUMS`.
-   - Publishes the GitHub Release with extracted notes from `CHANGELOG.md`.
+   - Generates and validates cryptographic `SHA256SUMS`.
+   - Publishes the GitHub Release live with attached binary assets and checksums (automatically creating the tag on `main` for manual dispatch, or verifying the pushed tag).
 
 ---
 

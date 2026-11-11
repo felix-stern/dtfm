@@ -4,6 +4,16 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version tag (e.g. v0.2.0)'
+        required: true
+        type: string
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -16,15 +26,24 @@ jobs:
     permissions:
       contents: read
     env:
-      TAG: ${{ github.ref_name }}
+      EVENT_NAME: ${{ github.event_name }}
+      INPUT_VERSION: ${{ inputs.version }}
+      REF_NAME: ${{ github.ref_name }}
     steps:
       - name: Validate strict SemVer tag
         run: |
-          semver_regex='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_VERSION"
+          else
+            TAG="$REF_NAME"
+          fi
+
+          semver_regex='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
           if [[ ! "$TAG" =~ $semver_regex ]]; then
-            echo "Error: Tag '$TAG' does not conform to strict SemVer!" >&2
+            echo "Error: Tag '$TAG' does not conform to strict SemVer (vMAJOR.MINOR.PATCH with no leading zeros)!" >&2
             exit 1
           fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
           echo "✓ Validated strict SemVer tag: $TAG"
 
       - name: Checkout repository
@@ -33,14 +52,56 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify commit ancestry on main
+      - name: Verify branch and commit ancestry on main
         run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+              echo "Error: Manual release dispatch must run against refs/heads/main, but got '$GITHUB_REF'!" >&2
+              exit 1
+            fi
+            echo "✓ Confirmed workflow dispatched on refs/heads/main."
+          fi
+
           git fetch --no-tags origin main:refs/remotes/origin/main
           if ! git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
-            echo "Error: Commit $GITHUB_SHA tagged by $TAG is not an ancestor of main!" >&2
+            echo "Error: Commit $GITHUB_SHA for release $TAG is not an ancestor of main!" >&2
             exit 1
           fi
           echo "✓ Verified commit ancestry on main."
+
+      - name: Verify release and tag collision guards
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Fail closed if a published (non-draft) release already exists for this tag
+          api_output="$(gh api -i "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" 2>&1 || true)"
+          http_status="$(printf '%s\n' "$api_output" | awk '/^HTTP\/[0-9.]* / {print $2; exit}')"
+          if [ "$http_status" = "200" ]; then
+            echo "Error: Published release '$TAG' already exists in $GITHUB_REPOSITORY!" >&2
+            exit 1
+          elif [ "$http_status" = "404" ]; then
+            echo "✓ Confirmed no existing published release for $TAG (HTTP 404)."
+          else
+            echo "Error: Failed to verify release status for $TAG (HTTP ${http_status:-unknown}):" >&2
+            echo "$api_output" >&2
+            exit 1
+          fi
+
+          # Verify remote tag-SHA on origin for both workflow_dispatch and push
+          existing_tag_sha="$(git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$TAG" "refs/tags/$TAG^{}" | awk -v r="refs/tags/$TAG" '$2 == r { sha=$1 } $2 == r "^{}" { peeled=$1 } END { print (peeled != "" ? peeled : sha) }')"
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ -n "$existing_tag_sha" ] && [ "$existing_tag_sha" != "$GITHUB_SHA" ]; then
+              echo "Error: Git tag 'refs/tags/$TAG' already exists on origin pointing to commit $existing_tag_sha, but current HEAD is $GITHUB_SHA!" >&2
+              exit 1
+            fi
+          else
+            if [ -z "$existing_tag_sha" ] || [ "$existing_tag_sha" != "$GITHUB_SHA" ]; then
+              echo "Error: Git tag 'refs/tags/$TAG' on origin does not match current commit $GITHUB_SHA (found: '$existing_tag_sha')!" >&2
+              exit 1
+            fi
+          fi
+          echo "✓ Release and tag collision checks passed."
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -66,6 +127,9 @@ jobs:
         run: |
           python3 scripts/extract-changelog.py "$TAG" CHANGELOG.md RELEASE_NOTES.md
           touch RELEASE_NOTES.md
+          if [ ! -s "RELEASE_NOTES.md" ]; then
+            echo "::warning::No release notes extracted from CHANGELOG.md for tag $TAG; falling back to automatic GitHub release notes."
+          fi
 
       - name: Build static binaries and package reproducible archives
         run: |
@@ -101,8 +165,8 @@ jobs:
 
             # Create reproducible tarball archive
             archive_name="dtfm_${VERSION}_${os}_${arch}.tar.gz"
-            GZIP=-n tar --owner=0 --group=0 --numeric-owner --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" \
-              -czf "artifacts/${archive_name}" -C "${target_dir}" dtfm lmdtfy README.md LICENSE CHANGELOG.md
+            tar --owner=0 --group=0 --numeric-owner --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" \
+              -cf - -C "${target_dir}" dtfm lmdtfy README.md LICENSE CHANGELOG.md | gzip -n > "artifacts/${archive_name}"
 
             # Copy standalone binary assets
             cp "${target_dir}/dtfm" "artifacts/dtfm-${os}-${arch}"
@@ -172,25 +236,68 @@ jobs:
     permissions:
       contents: write
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      TAG: ${{ github.ref_name }}
-      GITHUB_REPOSITORY: ${{ github.repository }}
+      EVENT_NAME: ${{ github.event_name }}
+      INPUT_VERSION: ${{ inputs.version }}
+      REF_NAME: ${{ github.ref_name }}
     steps:
       - name: Download release assets
         uses: actions/download-artifact@v7
         with:
           name: release-assets
 
-      - name: Publish GitHub Release (Draft -> Live Atomic Upload)
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Clean up any stale draft release from a previous attempt before recreating
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft 2>/dev/null | grep -q '^true$'; then
-            echo "Found stale draft release for $TAG; cleaning up before retry..."
-            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_VERSION"
+          else
+            TAG="$REF_NAME"
+          fi
+          export TAG
+
+          # 1. Re-verify cryptographic SHA256SUMS before publishing
+          echo "Re-verifying cryptographic SHA256SUMS..."
+          (cd artifacts && sha256sum -c SHA256SUMS)
+
+          # 2. Re-verify fail-closed published release check and remote tag-SHA invariant
+          api_output="$(gh api -i "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" 2>&1 || true)"
+          http_status="$(printf '%s\n' "$api_output" | awk '/^HTTP\/[0-9.]* / {print $2; exit}')"
+          if [ "$http_status" = "200" ]; then
+            echo "Error: Published release '$TAG' already exists in $GITHUB_REPOSITORY!" >&2
+            exit 1
+          elif [ "$http_status" = "404" ]; then
+            echo "✓ Confirmed no existing published release for $TAG (HTTP 404)."
+          else
+            echo "Error: Failed to verify release status for $TAG (HTTP ${http_status:-unknown}):" >&2
+            echo "$api_output" >&2
+            exit 1
           fi
 
+          existing_tag_sha="$(git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$TAG" "refs/tags/$TAG^{}" | awk -v r="refs/tags/$TAG" '$2 == r { sha=$1 } $2 == r "^{}" { peeled=$1 } END { print (peeled != "" ? peeled : sha) }')"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ -n "$existing_tag_sha" ] && [ "$existing_tag_sha" != "$GITHUB_SHA" ]; then
+              echo "Error: Git tag 'refs/tags/$TAG' already exists on origin pointing to commit $existing_tag_sha, but current HEAD is $GITHUB_SHA!" >&2
+              exit 1
+            fi
+          else
+            if [ -z "$existing_tag_sha" ] || [ "$existing_tag_sha" != "$GITHUB_SHA" ]; then
+              echo "Error: Git tag 'refs/tags/$TAG' on origin does not match current commit $GITHUB_SHA (found: '$existing_tag_sha')!" >&2
+              exit 1
+            fi
+          fi
+
+          # 3. Enumerate and delete all stale draft releases matching TAG by exact release ID
+          draft_ids="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq '.[] | select(.draft == true and .tag_name == env.TAG) | .id')"
+          for id in $draft_ids; do
+            echo "Cleaning up stale draft release ID $id for $TAG..."
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/${id}"
+          done
+
+          # 4. Determine release flags
           extra_flags=()
-          if [[ "$TAG" == *-* ]]; then
+          tag_core="${TAG%%+*}"
+          if [[ "$tag_core" == *-* ]]; then
             extra_flags+=("--prerelease")
           fi
 
@@ -200,18 +307,20 @@ jobs:
             extra_flags+=("--generate-notes")
           fi
 
-          echo "Creating draft release for $TAG..."
+          target_flags=()
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            target_flags+=("--target" "$GITHUB_SHA")
+          else
+            target_flags+=("--verify-tag")
+          fi
+
+          # 5. Single-step release creation (no split --draft + edit)
+          echo "Publishing release $TAG..."
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$TAG" \
-            --draft \
-            --verify-tag \
+            "${target_flags[@]}" \
             "${extra_flags[@]}" \
             artifacts/*
-
-          echo "Publishing release live..."
-          gh release edit "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --draft=false
 
           echo "✓ Release $TAG published successfully."

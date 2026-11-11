@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Manual release dispatch support (`workflow_dispatch`) in `.github/workflows/release.yml` with strict SemVer validation, `main` branch and ancestry verification, fail-closed existing-tag/release collision guards, automated Git tag creation on release publish, and single-step release creation ([#6](https://github.com/iinozemtsev-lab/dtfm/issues/6)).
 - GitHub Actions CI workflow (`.github/workflows/ci.yml`) validating formatting, `go vet`, multi-OS unit/race tests (`ubuntu-latest`, `macos-latest`), and static cross-compilation targets ([#3](https://github.com/iinozemtsev-lab/dtfm/issues/3)).
 - Automated GitHub Releases workflow (`.github/workflows/release.yml`) triggering on semver git tags (`v*`), compiling hermetic stripped static binaries (`CGO_ENABLED=0`), packaging multi-architecture tarballs with documentation and license, computing cryptographic `SHA256SUMS`, and publishing assets with automated release notes ([#3](https://github.com/iinozemtsev-lab/dtfm/issues/3)).
 - CLI version flags (`--version`, `-v`, `-version`) and `version` subcommands across `dtfm` and `lmdtfy` binaries with linker version injection support via `-ldflags="-s -w -X 'main.version=${TAG}'"` and build info fallback ([#3](https://github.com/iinozemtsev-lab/dtfm/issues/3)).
