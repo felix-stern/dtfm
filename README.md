@@ -80,24 +80,53 @@ make cross  # Cross-compile release binaries
 dtfm
 ```
 
-### 2. Connect Agent (Local, SSH, or E2EE Relay)
-- **Local Machine / Container**: `lmdtfy` connects automatically to the default socket path.
-- **Remote Server over SSH**: Forward the socket securely using `dtfm ssh-config`:
-  ```bash
-  # Automatically configure ~/.ssh/config with the correct RemoteForward path:
-  dtfm ssh-config dev-box --write
-  ssh dev-box
-  ```
-  *(Or ad-hoc forward: `ssh -R /run/user/<remote_uid>/lmdtfy.sock:<local_socket> dev-box`)*
-- **Cloud Sandboxes / NATs via E2EE Relay (No SSH keys required)**:
-  ```bash
-  # Operator starts relay listener (prints Agent Magic Link):
-  dtfm --relay
+### 2. Connect Agent
 
-  # Agent connects using the Magic Link URL or pairing token:
-  lmdtfy ping --relay "https://dtfm.dev/c/<session-id>#<key>"
-  lmdtfy exec --relay "https://dtfm.dev/c/<session-id>#<key>" --why "run migrations" make db-migrate
-  ```
+<details open>
+<summary><b>Agent on an SSH-Reachable VM / Server</b> — you can <code>ssh</code> from the <code>dtfm</code> host into the agent box</summary>
+
+From the machine running `dtfm`, SSH into the agent host to reverse-forward the approval socket (no SSH keys or credentials are placed on the agent):
+
+```bash
+# Preview the config snippet (omit --write), or write it into ~/.ssh/config:
+#   # Added by dtfm ssh-config
+#   Host agent-vm
+#       User ubuntu
+#       RemoteForward /run/user/1000/lmdtfy.sock /Users/you/.lmdtfy.sock
+#       StreamLocalBindUnlink yes
+dtfm ssh-config ubuntu@agent-vm --write
+ssh agent-vm
+```
+
+*(Or ad-hoc without editing `~/.ssh/config`: `ssh -R /run/user/<remote_uid>/lmdtfy.sock:<local_socket> ubuntu@agent-vm`)*
+
+</details>
+
+<details>
+<summary><b>Same Machine or Local Container</b> — shared local Unix socket</summary>
+
+`lmdtfy` connects automatically to the default local socket path (for containers, bind-mount the socket and set `LMDTFY_SOCKET` if UIDs differ).
+
+</details>
+
+<details>
+<summary><b>Cloud Sandboxes &amp; NATs via WebSockets</b> — self-hosted DIY (hosted relay coming soon)</summary>
+
+Bridge across NATs without inbound SSH using the included zero-knowledge E2EE `relay` server:
+
+```bash
+# 1. Run the stateless in-memory relay on any HTTPS/WSS endpoint:
+relay --listen 127.0.0.1:8080
+
+# 2. Operator connects to the relay (prints E2EE pairing token and Magic Link):
+dtfm --relay --relay-url wss://<relay-host>/ws
+
+# 3. Agent connects using the Magic Link URL (end-to-end encrypted):
+lmdtfy ping --relay "https://<relay-host>/c/<session-id>#<key>"
+lmdtfy exec --relay "https://<relay-host>/c/<session-id>#<key>" --why "run migrations" make db-migrate
+```
+
+</details>
 
 ### 3. Agent: Check Connectivity & Execute
 ```bash
