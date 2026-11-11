@@ -312,7 +312,8 @@ func TestPTYStaleKeystrokesDiscarded(t *testing.T) {
 	defer ptmx.Close()
 	defer pts.Close()
 
-	prompter := newPrompter(pts, pts, pts)
+	var stdout bytes.Buffer
+	prompter := newPrompter(pts, &stdout, pts)
 	defer prompter.Close()
 
 	// Write stale "y\n" to ptmx while idle (simulating user typing before prompt arrives)
@@ -420,7 +421,8 @@ func TestPTYPartialKeystrokeSurvivingTimeout(t *testing.T) {
 	defer ptmx.Close()
 	defer pts.Close()
 
-	prompter := newPrompter(pts, pts, pts)
+	var stdout bytes.Buffer
+	prompter := newPrompter(pts, &stdout, pts)
 	defer prompter.Close()
 
 	// Request 1 with 100ms timeout

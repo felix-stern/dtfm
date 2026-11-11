@@ -10,11 +10,26 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime/debug"
 	"strings"
 	"time"
 
 	"github.com/iinozemtsev-lab/dtfm/pkg/protocol"
 )
+
+var version = "dev"
+
+func getVersion() string {
+	if version != "" && version != "dev" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if info.Main.Version != "" && info.Main.Version != "(devel)" {
+			return info.Main.Version
+		}
+	}
+	return "dev"
+}
 
 // generateID creates a random hex string for correlating request and response envelopes.
 func generateID() string {
@@ -26,40 +41,22 @@ func generateID() string {
 	return hex.EncodeToString(b)
 }
 
-func main() {
-	if len(os.Args) < 2 {
-		printUsage()
-		os.Exit(1)
-	}
-
-	subcommand := os.Args[1]
-	switch subcommand {
-	case "-h", "--help", "help":
-		printUsage()
-		os.Exit(0)
-	case "ping":
-		runPing(os.Args[2:])
-	case "exec":
-		runExec(os.Args[2:])
-	default:
-		fmt.Fprintf(os.Stderr, "Unknown subcommand: %s\n", subcommand)
-		printUsage()
-		os.Exit(1)
-	}
-}
-
-func printUsage() {
-	fmt.Fprintf(os.Stderr, `lmdtfy — Agent-side dispatcher for human-in-the-loop command execution
+func printUsage(w io.Writer) {
+	fmt.Fprintf(w, `lmdtfy — Agent-side dispatcher for human-in-the-loop command execution
 
 Usage:
   lmdtfy ping [--socket <path>]
   lmdtfy exec --why "<reason>" [--socket <path>] [--timeout <sec>] [--cwd <dir>] <command> [args...]
+  lmdtfy version
+  lmdtfy -h, --help
 
 Options:
-  --why      Explanation of why this command needs to be executed (required for exec)
-  --socket   Path to lmdtfy Unix domain socket (default: /run/user/<uid>/lmdtfy.sock or ~/.lmdtfy.sock)
-  --timeout  Timeout in seconds bounding operator review and command execution separately (default: 300; worst-case ~2x wait)
-  --cwd      Working directory on target machine (default: dtfm's current directory)
+  --why         Explanation of why this command needs to be executed (required for exec)
+  --socket      Path to lmdtfy Unix domain socket (default: /run/user/<uid>/lmdtfy.sock or ~/.lmdtfy.sock)
+  --timeout     Timeout in seconds bounding operator review and command execution separately (default: 300; worst-case ~2x wait)
+  --cwd         Working directory on target machine (default: dtfm's current directory)
+  -v, --version Display version and exit
+  -h, --help    Display help and exit
 
 Exit Codes:
   0          Command executed successfully (or exit code of the executed command)
@@ -71,13 +68,59 @@ Exit Codes:
 `)
 }
 
-func runPing(args []string) {
-	fs := flag.NewFlagSet("ping", flag.ExitOnError)
-	sockPath := fs.String("socket", protocol.DefaultSocketPath(), "Socket path")
-	_ = fs.Parse(args)
+func run(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		printUsage(stderr)
+		return 1
+	}
 
-	code := executePing(*sockPath, os.Stdout, os.Stderr)
-	os.Exit(code)
+	subcommand := args[0]
+	switch subcommand {
+	case "-v", "--version", "-version", "version":
+		if len(args) > 1 {
+			fmt.Fprintf(stderr, "lmdtfy: %q does not accept extra arguments: %q\n", subcommand, args[1:])
+			return 1
+		}
+		fmt.Fprintf(stdout, "lmdtfy %s\n", getVersion())
+		return 0
+	case "-h", "--help", "help":
+		if len(args) > 1 {
+			fmt.Fprintf(stderr, "lmdtfy: %q does not accept extra arguments: %q\n", subcommand, args[1:])
+			return 1
+		}
+		printUsage(stdout)
+		return 0
+	case "ping":
+		return runPing(args[1:], stdout, stderr)
+	case "exec":
+		return runExec(args[1:], stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "Unknown subcommand: %s\n", subcommand)
+		printUsage(stderr)
+		return 1
+	}
+}
+
+func main() {
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+func runPing(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("ping", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	sockPath := fs.String("socket", protocol.DefaultSocketPath(), "Socket path")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 1
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "ping: unexpected arguments: %q\n", fs.Args())
+		return 1
+	}
+
+	return executePing(*sockPath, stdout, stderr)
 }
 
 func executePing(sockPath string, stdout, stderr io.Writer) int {
@@ -151,33 +194,38 @@ func executePing(sockPath string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func runExec(args []string) {
-	fs := flag.NewFlagSet("exec", flag.ExitOnError)
+func runExec(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	why := fs.String("why", "", "Reason for command execution")
 	sockPath := fs.String("socket", protocol.DefaultSocketPath(), "Socket path")
 	timeout := fs.Int("timeout", protocol.DefaultTimeoutSeconds, "Timeout in seconds bounding operator review and command execution separately")
 	cwd := fs.String("cwd", "", "Working directory on the target machine (default: dtfm's current directory)")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 1
+	}
 
 	cmdArgs := fs.Args()
 	if len(cmdArgs) == 0 || strings.TrimSpace(cmdArgs[0]) == "" {
-		fmt.Fprintln(os.Stderr, "Error: no command provided to execute")
-		printUsage()
-		os.Exit(1)
+		fmt.Fprintln(stderr, "Error: no command provided to execute")
+		printUsage(stderr)
+		return 1
 	}
 
 	if strings.TrimSpace(*why) == "" {
-		fmt.Fprintln(os.Stderr, "Error: --why flag is mandatory for agent transparency and cannot be empty")
-		os.Exit(1)
+		fmt.Fprintln(stderr, "Error: --why flag is mandatory for agent transparency and cannot be empty")
+		return 1
 	}
 
 	if *timeout <= 0 {
-		fmt.Fprintf(os.Stderr, "Error: --timeout must be greater than 0, got %d\n", *timeout)
-		os.Exit(1)
+		fmt.Fprintf(stderr, "Error: --timeout must be greater than 0, got %d\n", *timeout)
+		return 1
 	}
 
-	code := executeExec(cmdArgs, *sockPath, *timeout, *why, *cwd, os.Stdout, os.Stderr)
-	os.Exit(code)
+	return executeExec(cmdArgs, *sockPath, *timeout, *why, *cwd, stdout, stderr)
 }
 
 func executeExec(cmdArgs []string, sockPath string, timeout int, why string, cwd string, stdout, stderr io.Writer) int {

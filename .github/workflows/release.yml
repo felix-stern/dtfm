@@ -1,0 +1,217 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  verify-and-build:
+    name: Verify & Build Release
+    if: github.repository == 'iinozemtsev-lab/dtfm'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Validate strict SemVer tag
+        run: |
+          semver_regex='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if [[ ! "$TAG" =~ $semver_regex ]]; then
+            echo "Error: Tag '$TAG' does not conform to strict SemVer!" >&2
+            exit 1
+          fi
+          echo "✓ Validated strict SemVer tag: $TAG"
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify commit ancestry on main
+        run: |
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
+            echo "Error: Commit $GITHUB_SHA tagged by $TAG is not an ancestor of main!" >&2
+            exit 1
+          fi
+          echo "✓ Verified commit ancestry on main."
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Run pre-release quality gates
+        run: |
+          go mod verify
+          diffs=$(gofmt -s -d .)
+          if [ -n "$diffs" ]; then
+            echo "Unformatted Go files detected:"
+            echo "$diffs"
+            exit 1
+          fi
+          go vet ./...
+          go test -v -race ./...
+          python3 -W error scripts/test_extract_changelog.py
+          echo "✓ All pre-release quality gates passed."
+
+      - name: Extract Release Notes from CHANGELOG.md
+        run: |
+          python3 scripts/extract-changelog.py "$TAG" CHANGELOG.md RELEASE_NOTES.md
+          touch RELEASE_NOTES.md
+
+      - name: Build static binaries and package reproducible archives
+        run: |
+          VERSION="${TAG#v}"
+          PLATFORMS=("darwin/arm64" "darwin/amd64" "linux/amd64" "linux/arm64")
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+
+          mkdir -p dist artifacts
+
+          for platform in "${PLATFORMS[@]}"; do
+            os="${platform%/*}"
+            arch="${platform#*/}"
+            target_dir="dist/${os}-${arch}"
+            mkdir -p "${target_dir}"
+
+            echo "Building hermetic static binaries for ${os}/${arch} (${TAG})..."
+            CGO_ENABLED=0 GOOS="${os}" GOARCH="${arch}" go build \
+              -trimpath \
+              -ldflags="-s -w -X 'main.version=${TAG}'" \
+              -o "${target_dir}/dtfm" ./cmd/dtfm
+
+            CGO_ENABLED=0 GOOS="${os}" GOARCH="${arch}" go build \
+              -trimpath \
+              -ldflags="-s -w -X 'main.version=${TAG}'" \
+              -o "${target_dir}/lmdtfy" ./cmd/lmdtfy
+
+            # Include license, documentation, and changelog in package
+            cp README.md LICENSE CHANGELOG.md "${target_dir}/"
+
+            # Enforce hermetic file permissions
+            chmod 0755 "${target_dir}/dtfm" "${target_dir}/lmdtfy"
+            chmod 0644 "${target_dir}/README.md" "${target_dir}/LICENSE" "${target_dir}/CHANGELOG.md"
+
+            # Create reproducible tarball archive
+            archive_name="dtfm_${VERSION}_${os}_${arch}.tar.gz"
+            GZIP=-n tar --owner=0 --group=0 --numeric-owner --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" \
+              -czf "artifacts/${archive_name}" -C "${target_dir}" dtfm lmdtfy README.md LICENSE CHANGELOG.md
+
+            # Copy standalone binary assets
+            cp "${target_dir}/dtfm" "artifacts/dtfm-${os}-${arch}"
+            cp "${target_dir}/lmdtfy" "artifacts/lmdtfy-${os}-${arch}"
+          done
+
+      - name: Smoke test built binaries
+        run: |
+          chmod +x artifacts/dtfm-linux-amd64 artifacts/lmdtfy-linux-amd64
+          out_dtfm="$(./artifacts/dtfm-linux-amd64 --version)"
+          expected_dtfm="dtfm ${TAG}"
+          if [ "$out_dtfm" != "$expected_dtfm" ]; then
+            echo "Smoke test failed for dtfm: got '$out_dtfm', expected '$expected_dtfm'" >&2
+            exit 1
+          fi
+
+          out_lmdtfy="$(./artifacts/lmdtfy-linux-amd64 --version)"
+          expected_lmdtfy="lmdtfy ${TAG}"
+          if [ "$out_lmdtfy" != "$expected_lmdtfy" ]; then
+            echo "Smoke test failed for lmdtfy: got '$out_lmdtfy', expected '$expected_lmdtfy'" >&2
+            exit 1
+          fi
+          echo "✓ Smoke tests passed for linux-amd64 binaries."
+
+      - name: Verify static ELF linkage (all Linux targets)
+        run: |
+          linux_bins=(
+            "artifacts/dtfm-linux-amd64"
+            "artifacts/dtfm-linux-arm64"
+            "artifacts/lmdtfy-linux-amd64"
+            "artifacts/lmdtfy-linux-arm64"
+          )
+          for bin in "${linux_bins[@]}"; do
+            if ! command -v readelf >/dev/null 2>&1; then
+              echo "Error: readelf command not found" >&2
+              exit 1
+            fi
+            if readelf -l "$bin" | grep -E 'INTERP|DYNAMIC' >/dev/null; then
+              echo "Error: $bin contains dynamic or interpreter sections (not statically linked)!" >&2
+              exit 1
+            fi
+            echo "✓ Verified static ELF: $bin"
+          done
+
+      - name: Generate and verify cryptographic SHA256SUMS
+        working-directory: artifacts
+        run: |
+          sha256sum * > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          echo "Generated cryptographic checksums:"
+          cat SHA256SUMS
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-assets
+          path: |
+            artifacts/
+            RELEASE_NOTES.md
+          retention-days: 3
+
+  publish:
+    name: Publish Release
+    needs: verify-and-build
+    if: github.repository == 'iinozemtsev-lab/dtfm'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.ref_name }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v7
+        with:
+          name: release-assets
+
+      - name: Publish GitHub Release (Draft -> Live Atomic Upload)
+        run: |
+          # Clean up any stale draft release from a previous attempt before recreating
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft 2>/dev/null | grep -q '^true$'; then
+            echo "Found stale draft release for $TAG; cleaning up before retry..."
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes
+          fi
+
+          extra_flags=()
+          if [[ "$TAG" == *-* ]]; then
+            extra_flags+=("--prerelease")
+          fi
+
+          if [ -s "RELEASE_NOTES.md" ]; then
+            extra_flags+=("--notes-file" "RELEASE_NOTES.md")
+          else
+            extra_flags+=("--generate-notes")
+          fi
+
+          echo "Creating draft release for $TAG..."
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --draft \
+            --verify-tag \
+            "${extra_flags[@]}" \
+            artifacts/*
+
+          echo "Publishing release live..."
+          gh release edit "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false
+
+          echo "✓ Release $TAG published successfully."

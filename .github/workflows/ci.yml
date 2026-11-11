@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    if: github.repository == 'iinozemtsev-lab/dtfm' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Verify Go modules
+        run: go mod verify
+
+      - name: Check formatting (gofmt)
+        run: |
+          diffs=$(gofmt -s -d .)
+          if [ -n "$diffs" ]; then
+            echo "Unformatted Go files detected:"
+            echo "$diffs"
+            exit 1
+          fi
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run unit & race tests
+        env:
+          RUNNER_OS: ${{ runner.os }}
+          TMPDIR: /tmp
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            go test -v -race -ldflags="-linkmode=external" ./...
+          else
+            go test -v -race ./...
+          fi
+
+      - name: Run changelog extractor tests
+        run: python3 -W error scripts/test_extract_changelog.py
+
+      - name: Build local binaries
+        run: make build
+
+  cross-compile:
+    name: Multi-Platform Cross Compilation
+    if: github.repository == 'iinozemtsev-lab/dtfm' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Run cross compilation
+        run: make cross
+
+      - name: Verify build artifacts existence
+        run: |
+          targets=(
+            "bin/dist/dtfm-darwin-arm64"
+            "bin/dist/dtfm-darwin-amd64"
+            "bin/dist/dtfm-linux-amd64"
+            "bin/dist/dtfm-linux-arm64"
+            "bin/dist/lmdtfy-darwin-arm64"
+            "bin/dist/lmdtfy-darwin-amd64"
+            "bin/dist/lmdtfy-linux-amd64"
+            "bin/dist/lmdtfy-linux-arm64"
+          )
+          for target in "${targets[@]}"; do
+            if [ ! -f "$target" ]; then
+              echo "Error: missing expected artifact: $target" >&2
+              exit 1
+            fi
+            echo "✓ Artifact verified: $target ($(du -h "$target" | cut -f1))"
+          done
+
+      - name: Verify static ELF linkage (all Linux targets)
+        run: |
+          linux_binaries=(
+            "bin/dist/dtfm-linux-amd64"
+            "bin/dist/dtfm-linux-arm64"
+            "bin/dist/lmdtfy-linux-amd64"
+            "bin/dist/lmdtfy-linux-arm64"
+          )
+          for bin in "${linux_binaries[@]}"; do
+            if ! command -v readelf >/dev/null 2>&1; then
+              echo "Error: readelf command not found" >&2
+              exit 1
+            fi
+            if readelf -l "$bin" | grep -E 'INTERP|DYNAMIC' >/dev/null; then
+              echo "Error: $bin contains dynamic or interpreter sections (not statically linked)!" >&2
+              exit 1
+            fi
+            echo "✓ Verified static ELF binary: $bin"
+          done

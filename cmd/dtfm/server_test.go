@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -62,9 +63,23 @@ func (m *mockPrompter) Close() error {
 	return nil
 }
 
+func shortTempSockDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "s-*")
+	if err != nil {
+		dir, err = os.MkdirTemp("", "s-*")
+		if err != nil {
+			t.Fatalf("failed to create short temp socket dir: %v", err)
+		}
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	_ = os.Chmod(dir, 0700)
+	return dir
+}
+
 func TestServerPingAndExecFlow(t *testing.T) {
-	tmpDir := t.TempDir()
-	sockPath := filepath.Join(tmpDir, "dtfm.sock")
+	tmpDir := shortTempSockDir(t)
+	sockPath := filepath.Join(tmpDir, "s.sock")
 
 	listener, err := net.Listen("unix", sockPath)
 	if err != nil {
@@ -160,8 +175,8 @@ func TestServerPingAndExecFlow(t *testing.T) {
 
 func TestServerDeadStdinSecurityRepro(t *testing.T) {
 	// A prompter connected to EOF stream must reject the execution request!
-	tmpDir := t.TempDir()
-	sockPath := filepath.Join(tmpDir, "dtfm.sock")
+	tmpDir := shortTempSockDir(t)
+	sockPath := filepath.Join(tmpDir, "s.sock")
 
 	listener, err := net.Listen("unix", sockPath)
 	if err != nil {
@@ -215,8 +230,8 @@ func TestServerDeadStdinSecurityRepro(t *testing.T) {
 
 func TestServerConcurrentPingDuringApproval(t *testing.T) {
 	// Verifies that a ping request is NOT blocked while an interactive approval is waiting for operator
-	tmpDir := t.TempDir()
-	sockPath := filepath.Join(tmpDir, "dtfm.sock")
+	tmpDir := shortTempSockDir(t)
+	sockPath := filepath.Join(tmpDir, "s.sock")
 
 	listener, err := net.Listen("unix", sockPath)
 	if err != nil {
@@ -281,8 +296,8 @@ func TestServerConcurrentPingDuringApproval(t *testing.T) {
 }
 
 func TestServerExecTimeout(t *testing.T) {
-	tmpDir := t.TempDir()
-	sockPath := filepath.Join(tmpDir, "dtfm.sock")
+	tmpDir := shortTempSockDir(t)
+	sockPath := filepath.Join(tmpDir, "s.sock")
 
 	listener, err := net.Listen("unix", sockPath)
 	if err != nil {
@@ -334,8 +349,8 @@ func TestQueuedRequestExpiredBeforeReview(t *testing.T) {
 	// Verifies that a queued request that waits longer than its TimeoutSeconds
 	// behind an earlier slow request immediately fails with StatusTimeout
 	// without prompting the operator.
-	tmpDir := t.TempDir()
-	sockPath := filepath.Join(tmpDir, "dtfm.sock")
+	tmpDir := shortTempSockDir(t)
+	sockPath := filepath.Join(tmpDir, "s.sock")
 
 	listener, err := net.Listen("unix", sockPath)
 	if err != nil {
@@ -483,8 +498,8 @@ func TestKillActiveChildSignalHandler(t *testing.T) {
 func TestServerClientDisconnectDuringPrompt(t *testing.T) {
 	// Client disconnect during operator prompt must immediately
 	// cancel promptCtx and reject request rather than executing or lingering, and release s.mu.
-	tmpDir := t.TempDir()
-	sockPath := filepath.Join(tmpDir, "disconnect.sock")
+	tmpDir := shortTempSockDir(t)
+	sockPath := filepath.Join(tmpDir, "s.sock")
 
 	listener, err := net.Listen("unix", sockPath)
 	if err != nil {
@@ -592,8 +607,8 @@ func TestServerClientDisconnectDuringPrompt(t *testing.T) {
 
 func TestServerRejectsCustomEnvRequest(t *testing.T) {
 	// Custom environment variables from the agent are rejected for security
-	tmpDir := t.TempDir()
-	sockPath := filepath.Join(tmpDir, "reject_env.sock")
+	tmpDir := shortTempSockDir(t)
+	sockPath := filepath.Join(tmpDir, "s.sock")
 
 	listener, err := net.Listen("unix", sockPath)
 	if err != nil {
@@ -643,8 +658,8 @@ func TestServerRejectsCustomEnvRequest(t *testing.T) {
 }
 
 func TestServerRejectsEmptyCommandAndReason(t *testing.T) {
-	tmpDir := t.TempDir()
-	sockPath := filepath.Join(tmpDir, "dtfm.sock")
+	tmpDir := shortTempSockDir(t)
+	sockPath := filepath.Join(tmpDir, "s.sock")
 
 	listener, err := net.Listen("unix", sockPath)
 	if err != nil {
@@ -700,8 +715,8 @@ func TestServerRejectsEmptyCommandAndReason(t *testing.T) {
 }
 
 func TestServerQueuedRequestTimesOutWhileWaiting(t *testing.T) {
-	tmpDir := t.TempDir()
-	sockPath := filepath.Join(tmpDir, "dtfm.sock")
+	tmpDir := shortTempSockDir(t)
+	sockPath := filepath.Join(tmpDir, "s.sock")
 
 	listener, err := net.Listen("unix", sockPath)
 	if err != nil {
@@ -772,8 +787,8 @@ func TestServerQueuedRequestTimesOutWhileWaiting(t *testing.T) {
 }
 
 func TestServerQueuedClientDisconnectBeforeTurn(t *testing.T) {
-	tmpDir := t.TempDir()
-	sockPath := filepath.Join(tmpDir, "dtfm.sock")
+	tmpDir := shortTempSockDir(t)
+	sockPath := filepath.Join(tmpDir, "s.sock")
 
 	listener, err := net.Listen("unix", sockPath)
 	if err != nil {
@@ -856,8 +871,8 @@ func TestServerQueuedClientDisconnectBeforeTurn(t *testing.T) {
 }
 
 func TestServerOversizedMessageTypeError(t *testing.T) {
-	tmpDir := t.TempDir()
-	sockPath := filepath.Join(tmpDir, "dtfm.sock")
+	tmpDir := shortTempSockDir(t)
+	sockPath := filepath.Join(tmpDir, "s.sock")
 
 	listener, err := net.Listen("unix", sockPath)
 	if err != nil {
@@ -916,8 +931,8 @@ func TestServerOversizedMessageTypeError(t *testing.T) {
 }
 
 func TestServerShutdownDuringActivePromptAndIdleConn(t *testing.T) {
-	tmpDir := t.TempDir()
-	sockPath := filepath.Join(tmpDir, "dtfm.sock")
+	tmpDir := shortTempSockDir(t)
+	sockPath := filepath.Join(tmpDir, "s.sock")
 
 	listener, err := net.Listen("unix", sockPath)
 	if err != nil {
@@ -1027,5 +1042,92 @@ func TestCommandExecutorContextCancellation(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "🔌 Command execution cancelled") {
 		t.Fatalf("Expected '🔌 Command execution cancelled' banner, got: %s", stdout.String())
+	}
+}
+
+func TestCLIVersion(t *testing.T) {
+	origVersion := version
+	defer func() { version = origVersion }()
+
+	version = "v1.2.3"
+
+	for _, flag := range []string{"--version", "-v", "-version", "version"} {
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"dtfm", flag}, &stdout, &stderr)
+		if code != 0 {
+			t.Errorf("run(%q) returned code %d, stderr: %s", flag, code, stderr.String())
+		}
+		expected := "dtfm v1.2.3\n"
+		if stdout.String() != expected {
+			t.Errorf("run(%q) stdout = %q, expected %q", flag, stdout.String(), expected)
+		}
+		if stderr.Len() != 0 {
+			t.Errorf("run(%q) stderr = %q, expected empty", flag, stderr.String())
+		}
+	}
+}
+
+func TestCLIVersionNoSocketSideEffects(t *testing.T) {
+	tmpDir := shortTempSockDir(t)
+	nonExistentDir := filepath.Join(tmpDir, "do-not-create")
+	sockPath := filepath.Join(nonExistentDir, "lmdtfy.sock")
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"dtfm", "--socket", sockPath, "--version"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run with --socket and --version returned %d, stderr: %s", code, stderr.String())
+	}
+	if _, err := os.Stat(nonExistentDir); !os.IsNotExist(err) {
+		t.Fatalf("run with --version should NOT create socket directory %s", nonExistentDir)
+	}
+}
+
+func TestCLIVersionExtraArgs(t *testing.T) {
+	testCases := [][]string{
+		{"dtfm", "version", "extra"},
+		{"dtfm", "--version", "extra"},
+		{"dtfm", "-v", "extra1", "extra2"},
+	}
+
+	for _, tc := range testCases {
+		var stdout, stderr bytes.Buffer
+		code := run(tc, &stdout, &stderr)
+		if code != 1 {
+			t.Errorf("run(%v) = %d, expected 1", tc, code)
+		}
+		if !strings.Contains(stderr.String(), "extra arguments") {
+			t.Errorf("run(%v) stderr = %q, expected 'extra arguments' message", tc, stderr.String())
+		}
+	}
+}
+
+func TestCLIHelp(t *testing.T) {
+	for _, flag := range []string{"--help", "-h", "help"} {
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"dtfm", flag}, &stdout, &stderr)
+		if code != 0 {
+			t.Errorf("run(%q) returned code %d, stderr: %s", flag, code, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "Usage:") {
+			t.Errorf("run(%q) stdout = %q, expected usage banner", flag, stdout.String())
+		}
+	}
+}
+
+func TestCLIUnknownArgs(t *testing.T) {
+	testCases := [][]string{
+		{"dtfm", "unknown-subcommand"},
+		{"dtfm", "--socket", "/tmp/nonexistent.sock", "unexpected-trailing-arg"},
+	}
+
+	for _, tc := range testCases {
+		var stdout, stderr bytes.Buffer
+		code := run(tc, &stdout, &stderr)
+		if code != 1 {
+			t.Errorf("run(%v) = %d, expected 1", tc, code)
+		}
+		if !strings.Contains(stderr.String(), "unknown command") {
+			t.Errorf("run(%v) stderr = %q, expected 'unknown command' message", tc, stderr.String())
+		}
 	}
 }

@@ -2,7 +2,20 @@
 
 BINARY_DIR := bin
 GO_FLAGS := CGO_ENABLED=0
-BUILD_FLAGS := -trimpath -ldflags="-s -w"
+
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null)
+ifeq ($(strip $(VERSION)),)
+VERSION := dev
+endif
+
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+TEST_LDFLAGS := -ldflags="-linkmode=external"
+else
+TEST_LDFLAGS :=
+endif
+
+BUILD_FLAGS := -trimpath -ldflags="-s -w -X 'main.version=$(VERSION)'"
 PLATFORMS := darwin/arm64 darwin/amd64 linux/amd64 linux/arm64
 
 all: vet test build
@@ -26,7 +39,8 @@ cross:
 	done
 
 test:
-	go test -v -race ./...
+	go test -v -race $(TEST_LDFLAGS) ./...
+	python3 -W error scripts/test_extract_changelog.py
 
 clean:
-	rm -rf $(BINARY_DIR)
+	rm -rf $(BINARY_DIR) dist artifacts RELEASE_NOTES.md

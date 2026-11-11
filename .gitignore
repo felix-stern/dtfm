@@ -1,3 +1,8 @@
 bin/
+dist/
+artifacts/
+RELEASE_NOTES.md
 .DS_Store
 *.sock
+__pycache__/
+*.pyc

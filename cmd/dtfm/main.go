@@ -8,19 +8,38 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
 	"github.com/iinozemtsev-lab/dtfm/pkg/protocol"
 )
 
+var version = "dev"
+
+func getVersion() string {
+	if version != "" && version != "dev" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if info.Main.Version != "" && info.Main.Version != "(devel)" {
+			return info.Main.Version
+		}
+	}
+	return "dev"
+}
+
 func printMainUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  dtfm [options]                    Start dtfm operator server (default)")
 	fmt.Fprintln(w, "  dtfm ssh-config <host> [options]  Generate OpenSSH RemoteForward snippet")
+	fmt.Fprintln(w, "  dtfm version                      Display version and exit")
+	fmt.Fprintln(w, "  dtfm -h, --help                   Display help and exit")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Server options:")
 	fmt.Fprintln(w, "  --socket <path>   Path to listen Unix domain socket (default: /run/user/<uid>/lmdtfy.sock or ~/.lmdtfy.sock)")
+	fmt.Fprintln(w, "  -v, --version     Display version and exit")
+	fmt.Fprintln(w, "  -h, --help        Display help and exit")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Helper command options (dtfm ssh-config):")
 	fmt.Fprintln(w, "  -w, --write       Atomically append or update host entry in ~/.ssh/config")
@@ -35,6 +54,13 @@ func main() {
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) > 1 {
 		switch args[1] {
+		case "version", "-v", "--version", "-version":
+			if len(args) > 2 {
+				fmt.Fprintf(stderr, "dtfm: %q does not accept extra arguments: %q\n", args[1], args[2:])
+				return 1
+			}
+			fmt.Fprintf(stdout, "dtfm %s\n", getVersion())
+			return 0
 		case "ssh-config", "sshconfig":
 			return RunSSHConfig(args[2:], stdout, stderr, SSHConfigOptions{})
 		case "help":
@@ -53,6 +79,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	fs.Usage = func() {}
 	sockPath := fs.String("socket", protocol.DefaultSocketPath(), "Path to listen Unix domain socket")
+	showVersion := fs.Bool("version", false, "Display version and exit")
+	showVersionShort := fs.Bool("v", false, "Display version and exit")
+	showHelp := fs.Bool("help", false, "Display help and exit")
+	showHelpShort := fs.Bool("h", false, "Display help and exit")
+
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			printMainUsage(stdout)
@@ -60,6 +91,20 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		printMainUsage(stderr)
 		return 1
+	}
+
+	if *showHelp || *showHelpShort {
+		printMainUsage(stdout)
+		return 0
+	}
+
+	if *showVersion || *showVersionShort {
+		if fs.NArg() > 0 {
+			fmt.Fprintf(stderr, "dtfm: version flag does not accept extra arguments: %q\n", fs.Args())
+			return 1
+		}
+		fmt.Fprintf(stdout, "dtfm %s\n", getVersion())
+		return 0
 	}
 
 	if fs.NArg() > 0 {

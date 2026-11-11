@@ -28,13 +28,32 @@ Agent / Remote Host                        Operator Workstation
 
 ## Installation & Build
 
+### Prebuilt Binaries (GitHub Releases)
+
+Hermetic, statically linked binaries are published on [GitHub Releases](https://github.com/iinozemtsev-lab/dtfm/releases) for `darwin-arm64`, `darwin-amd64`, `linux-amd64`, and `linux-arm64`:
+
+```bash
+# Example: Download release archive and checksum file (replace v0.1.0 with target version)
+curl -LO https://github.com/iinozemtsev-lab/dtfm/releases/download/v0.1.0/dtfm_0.1.0_linux_amd64.tar.gz
+curl -LO https://github.com/iinozemtsev-lab/dtfm/releases/download/v0.1.0/SHA256SUMS
+
+# Verify cryptographic integrity
+sha256sum --ignore-missing -c SHA256SUMS
+
+# Extract binaries and install
+tar -xzf dtfm_0.1.0_linux_amd64.tar.gz
+sudo install -m 0755 dtfm lmdtfy /usr/local/bin/
+```
+
+### Build from Source
+
 Requires Go 1.22+.
 
 ```bash
 # Build local binaries in bin/
 make
 
-# Run tests with race detection
+# Run unit tests and race detection
 make test
 
 # Cross-compile static binaries (darwin-arm64, darwin-amd64, linux-amd64, linux-arm64)
@@ -141,6 +160,15 @@ printf "# Added by dtfm ssh-config\nHost remote-host\n    RemoteForward /run/use
 
 ## CLI Options
 
+### `dtfm`
+
+| Flag / Subcommand | Description | Default |
+|-------------------|-------------|---------|
+| `--socket <path>` | Path to listen Unix domain socket | `/run/user/<uid>/lmdtfy.sock` or `~/.lmdtfy.sock` |
+| `-v`, `--version` | Display version and exit | |
+| `version` | Subcommand to display version and exit | |
+| `-h`, `--help` | Display help and exit | |
+
 ### `dtfm ssh-config`
 
 | Flag | Description | Default |
@@ -158,6 +186,16 @@ printf "# Added by dtfm ssh-config\nHost remote-host\n    RemoteForward /run/use
 | `--timeout` | Timeout in seconds bounding review and execution separately | `300` |
 | `--cwd` | Working directory on the operator's machine | `dtfm`'s current directory |
 
+### `lmdtfy version`
+
+```bash
+lmdtfy version
+# or
+lmdtfy -v
+# or
+lmdtfy --version
+```
+
 ---
 
 ## Exit Codes
@@ -171,6 +209,56 @@ printf "# Added by dtfm ssh-config\nHost remote-host\n    RemoteForward /run/use
 | `126` | Command execution rejected by operator or denied by security policy |
 | `127` | Command failed to start (executable not found or permission error) |
 | `128+N` | Command terminated by signal `N` (e.g. `130` for `SIGINT`, `137` for `SIGKILL`) |
+
+---
+
+## Release Process & Version Tagging
+
+This repository adheres to [Semantic Versioning](https://semver.org/) and follows [Keep a Changelog](https://keepachangelog.com/). Releases are fully automated via GitHub Actions (`.github/workflows/release.yml`).
+
+### Step-by-Step Tagging Workflow
+
+1. **Update `CHANGELOG.md`**:
+   - Move completed changes from the `[Unreleased]` section into a new version block:
+     ```markdown
+     ## [0.2.0] - 2026-11-15
+     ### Added
+     ...
+     ```
+   - Update comparison links at the bottom of `CHANGELOG.md`.
+
+2. **Commit and Merge**:
+   - Submit a pull request with the updated `CHANGELOG.md` and any final version bumps.
+   - Once approved and merged to `main`, pull the latest `main`.
+
+3. **Tag the Release**:
+   - Create an annotated Git semver tag (prefixed with `v`):
+     ```bash
+     git tag -a v0.2.0 -m "Release v0.2.0"
+     ```
+
+4. **Push the Tag**:
+   - Push the tag to upstream:
+     ```bash
+     git push upstream v0.2.0
+     ```
+
+5. **Automated Publishing**:
+   - The `.github/workflows/release.yml` workflow triggers automatically on tag push.
+   - It builds hermetic, stripped static binaries (`CGO_ENABLED=0`, `-trimpath -ldflags="-s -w -X 'main.version=${TAG}'"`) for:
+     - `darwin/arm64` (Apple Silicon)
+     - `darwin/amd64` (macOS Intel)
+     - `linux/amd64` (Linux x86_64)
+     - `linux/arm64` (Linux ARM64 / aarch64)
+   - Packages tarball archives (`dtfm_<VERSION>_<OS>_<ARCH>.tar.gz`) containing `dtfm`, `lmdtfy`, `README.md`, `LICENSE`, and `CHANGELOG.md` with reproducible `0:0` ownership and `SOURCE_DATE_EPOCH` timestamps.
+   - Generates cryptographic `SHA256SUMS`.
+   - Publishes the GitHub Release with extracted notes from `CHANGELOG.md`.
+
+---
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for full historical release notes.
 
 ---
 

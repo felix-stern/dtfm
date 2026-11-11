@@ -24,10 +24,27 @@ func TestGenerateID(t *testing.T) {
 	}
 }
 
+func shortTempSockDir(t *testing.T) string {
+	t.Helper()
+	baseDir := ""
+	if tmp := os.TempDir(); len(tmp) > 60 {
+		baseDir = "/tmp"
+	}
+	dir, err := os.MkdirTemp(baseDir, "s-*")
+	if err != nil {
+		dir, err = os.MkdirTemp("", "s-*")
+		if err != nil {
+			t.Fatalf("failed to create short temp socket dir: %v", err)
+		}
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	_ = os.Chmod(dir, 0700)
+	return dir
+}
+
 func TestExecutePing(t *testing.T) {
-	tmpDir := t.TempDir()
-	_ = os.Chmod(tmpDir, 0700)
-	sockPath := filepath.Join(tmpDir, "lmdtfy_ping.sock")
+	tmpDir := shortTempSockDir(t)
+	sockPath := filepath.Join(tmpDir, "p.sock")
 
 	// 1. Inactive socket returns code 2
 	var stdout, stderr bytes.Buffer
@@ -75,9 +92,8 @@ func TestExecutePing(t *testing.T) {
 }
 
 func TestExecuteExecFlows(t *testing.T) {
-	tmpDir := t.TempDir()
-	_ = os.Chmod(tmpDir, 0700)
-	sockPath := filepath.Join(tmpDir, "lmdtfy_exec.sock")
+	tmpDir := shortTempSockDir(t)
+	sockPath := filepath.Join(tmpDir, "e.sock")
 
 	listener, err := net.Listen("unix", sockPath)
 	if err != nil {
@@ -187,9 +203,8 @@ func TestExecuteExecFlows(t *testing.T) {
 }
 
 func TestExecuteEnvelopeValidation(t *testing.T) {
-	tmpDir := t.TempDir()
-	_ = os.Chmod(tmpDir, 0700)
-	sockPath := filepath.Join(tmpDir, "lmdtfy_val.sock")
+	tmpDir := shortTempSockDir(t)
+	sockPath := filepath.Join(tmpDir, "v.sock")
 
 	listener, err := net.Listen("unix", sockPath)
 	if err != nil {
@@ -255,8 +270,7 @@ func TestExecuteEnvelopeValidation(t *testing.T) {
 }
 
 func TestClientNonExistentSocketDirReturnsCode2(t *testing.T) {
-	td := t.TempDir()
-	_ = os.Chmod(td, 0700)
+	td := shortTempSockDir(t)
 	nonExistentDir := filepath.Join(td, "non-existent-subdir")
 	sockPath := filepath.Join(nonExistentDir, "test.sock")
 
@@ -276,5 +290,81 @@ func TestClientNonExistentSocketDirReturnsCode2(t *testing.T) {
 	}
 	if _, err := os.Lstat(nonExistentDir); !os.IsNotExist(err) {
 		t.Fatalf("Directory %s should NOT have been created by executeExec!", nonExistentDir)
+	}
+}
+
+func TestCLIVersion(t *testing.T) {
+	origVersion := version
+	defer func() { version = origVersion }()
+
+	version = "v1.2.3"
+
+	for _, flag := range []string{"--version", "-v", "-version", "version"} {
+		var stdout, stderr bytes.Buffer
+		code := run([]string{flag}, &stdout, &stderr)
+		if code != 0 {
+			t.Errorf("run(%q) returned code %d, stderr: %s", flag, code, stderr.String())
+		}
+		expected := "lmdtfy v1.2.3\n"
+		if stdout.String() != expected {
+			t.Errorf("run(%q) stdout = %q, expected %q", flag, stdout.String(), expected)
+		}
+		if stderr.Len() != 0 {
+			t.Errorf("run(%q) stderr = %q, expected empty", flag, stderr.String())
+		}
+	}
+}
+
+func TestCLIVersionExtraArgs(t *testing.T) {
+	testCases := [][]string{
+		{"version", "extra"},
+		{"--version", "extra"},
+		{"-v", "extra1", "extra2"},
+	}
+
+	for _, tc := range testCases {
+		var stdout, stderr bytes.Buffer
+		code := run(tc, &stdout, &stderr)
+		if code != 1 {
+			t.Errorf("run(%v) = %d, expected 1", tc, code)
+		}
+		if !strings.Contains(stderr.String(), "extra arguments") {
+			t.Errorf("run(%v) stderr = %q, expected 'extra arguments' message", tc, stderr.String())
+		}
+	}
+}
+
+func TestCLIHelp(t *testing.T) {
+	for _, flag := range []string{"--help", "-h", "help"} {
+		var stdout, stderr bytes.Buffer
+		code := run([]string{flag}, &stdout, &stderr)
+		if code != 0 {
+			t.Errorf("run(%q) returned code %d, stderr: %s", flag, code, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "Usage:") {
+			t.Errorf("run(%q) stdout = %q, expected usage banner", flag, stdout.String())
+		}
+	}
+}
+
+func TestCLIUnknownSubcommand(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"unknown-cmd"}, &stdout, &stderr)
+	if code != 1 {
+		t.Errorf("run(unknown-cmd) = %d, expected 1", code)
+	}
+	if !strings.Contains(stderr.String(), "Unknown subcommand") {
+		t.Errorf("run(unknown-cmd) stderr = %q, expected 'Unknown subcommand' message", stderr.String())
+	}
+}
+
+func TestCLINoArgs(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{}, &stdout, &stderr)
+	if code != 1 {
+		t.Errorf("run([]) = %d, expected 1", code)
+	}
+	if !strings.Contains(stderr.String(), "Usage:") {
+		t.Errorf("run([]) stderr = %q, expected usage banner", stderr.String())
 	}
 }
