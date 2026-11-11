@@ -1134,3 +1134,108 @@ func TestCLIUnknownArgs(t *testing.T) {
 		}
 	}
 }
+
+func TestServerEnvRejectNoOutputBeforeSemaphore(t *testing.T) {
+	tmpDir := shortTempSockDir(t)
+	sockPath := filepath.Join(tmpDir, "s.sock")
+
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+	defer listener.Close()
+
+	var outBuf syncBuffer
+	prompter := &mockPrompter{decision: DecisionApprove}
+	server := NewServer(listener, prompter)
+	server.executor = NewCommandExecutor(&outBuf, &outBuf)
+	go server.Serve()
+
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatalf("Dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	req := protocol.CommandRequest{
+		ID:             "env-spoof-test",
+		Reason:         "Spoof test",
+		Command:        "echo",
+		Args:           []string{"spoof"},
+		Env:            map[string]string{"EVIL_VAR": "payload"},
+		TimeoutSeconds: 5,
+	}
+	env, _ := protocol.NewEnvelope(protocol.TypeExec, req)
+	if err := json.NewEncoder(conn).Encode(env); err != nil {
+		t.Fatalf("Encode failed: %v", err)
+	}
+
+	var respEnv protocol.Envelope
+	if err := json.NewDecoder(conn).Decode(&respEnv); err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	// Verify terminal output buffer was NEVER written to before acquiring semaphore
+	if outBuf.String() != "" {
+		t.Fatalf("SECURITY VIOLATION: server wrote to executor output before acquiring semaphore: %q", outBuf.String())
+	}
+}
+
+func TestServerUnchangedEditDirectExecution(t *testing.T) {
+	tmpDir := shortTempSockDir(t)
+	sockPath := filepath.Join(tmpDir, "s.sock")
+
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+	defer listener.Close()
+
+	var outBuf syncBuffer
+	// Operator selected DecisionEdit, but the edited string is identical to protocol.FormatCommand
+	unchangedCmd := protocol.FormatCommand("echo", []string{"direct-exec-unchanged"})
+	prompter := &mockPrompter{
+		decision:  DecisionEdit,
+		editedCmd: unchangedCmd,
+	}
+	server := NewServer(listener, prompter)
+	server.executor = NewCommandExecutor(&outBuf, &outBuf)
+	go server.Serve()
+
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatalf("Dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	req := protocol.CommandRequest{
+		ID:             "unchanged-edit-test",
+		Reason:         "Unchanged edit fast path",
+		Command:        "echo",
+		Args:           []string{"direct-exec-unchanged"},
+		TimeoutSeconds: 5,
+	}
+	env, _ := protocol.NewEnvelope(protocol.TypeExec, req)
+	if err := json.NewEncoder(conn).Encode(env); err != nil {
+		t.Fatalf("Encode failed: %v", err)
+	}
+
+	var respEnv protocol.Envelope
+	if err := json.NewDecoder(conn).Decode(&respEnv); err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	var resp protocol.CommandResponse
+	_ = json.Unmarshal(respEnv.Data, &resp)
+	if resp.Status != protocol.StatusApproved {
+		t.Fatalf("Expected StatusApproved, got %s", resp.Status)
+	}
+	// Unchanged edit should NOT have ModifiedCommand set (direct execution)
+	if resp.ModifiedCommand != "" {
+		t.Errorf("Expected ModifiedCommand to be empty for unchanged edit, got %q", resp.ModifiedCommand)
+	}
+	// Execution banner should be "⚡ Executing: echo direct-exec-unchanged", NOT "⚡ Executing (edited):"
+	if !strings.Contains(outBuf.String(), "⚡ Executing: echo direct-exec-unchanged") {
+		t.Errorf("Expected direct execution banner, got: %s", outBuf.String())
+	}
+}

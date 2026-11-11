@@ -8,8 +8,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -642,11 +644,13 @@ func TestPTYCtrlDDoesNotBrickSubsequentPrompts(t *testing.T) {
 	}
 
 	// Request 2: Operator types 'y\n'. Prompter must still be alive and accept approval!
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	// Wait out the 300ms post-abort cooldown so DrainPendingInput does not discard Request 2's input
+	time.Sleep(350 * time.Millisecond)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel2()
 
 	go func() {
-		time.Sleep(30 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 		_, _ = ptmx.Write([]byte("y\n"))
 	}()
 
@@ -767,5 +771,1312 @@ func TestApprovalLongCwdAndNonExistentIntermediate(t *testing.T) {
 
 	if !strings.Contains(out, "Directory does not exist locally") {
 		t.Errorf("Expected nonexistent warning for path with nonexistent intermediate component, got: %s", out)
+	}
+}
+
+func TestApprovalContrastNoBrightCyan(t *testing.T) {
+	// Verify that bright cyan (\033[1;36m) is NOT present in prompter output.
+	// Bold blue (\033[1;34m) should be used instead for high contrast across light/dark themes.
+	ptmx, pts, err := pty.Open()
+	if err != nil {
+		t.Fatalf("Failed to open PTY: %v", err)
+	}
+	defer ptmx.Close()
+	defer pts.Close()
+
+	var stdout bytes.Buffer
+	prompter := newPrompter(pts, &stdout, pts)
+	defer prompter.Close()
+
+	req := protocol.CommandRequest{
+		ID:      "test-contrast",
+		Reason:  "High contrast color check",
+		Command: "ls",
+		Args:    []string{"-la"},
+		Cwd:     "/tmp",
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		_, _ = ptmx.Write([]byte("n\nDeclined\n"))
+	}()
+
+	_, _, _, _ = prompter.Prompt(ctx, req)
+	output := stdout.String()
+
+	if strings.Contains(output, "\033[1;36m") {
+		t.Errorf("CRITICAL CONTRAST BUG: Found washed-out bright cyan \\033[1;36m in terminal output:\n%s", output)
+	}
+	if !strings.Contains(output, "\033[1;34m") {
+		t.Errorf("Expected high-contrast bold blue \\033[1;34m in terminal output:\n%s", output)
+	}
+}
+
+func TestWYSIWYGExecutionBannerForEditedCommand(t *testing.T) {
+	var stdout bytes.Buffer
+	executor := NewCommandExecutor(&stdout, &stdout)
+
+	ctx := context.Background()
+	resp := executor.ExecuteShell(ctx, "test-edit-banner", "echo 'hello from ivan'", "", time.Now())
+	if resp.ExitCode != 0 {
+		t.Fatalf("Expected exit code 0, got %d", resp.ExitCode)
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "⚡ Executing (edited): echo 'hello from ivan'") {
+		t.Errorf("Expected WYSIWYG execution banner '⚡ Executing (edited): echo 'hello from ivan'', got:\n%s", out)
+	}
+	if strings.Contains(out, "/bash --noprofile") || strings.Contains(out, "/sh -c") {
+		t.Errorf("Execution banner exposed internal shell wrapper:\n%s", out)
+	}
+}
+
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (n int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+func waitForPromptOutput(buf *syncBuffer, substr string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if strings.Contains(buf.String(), substr) {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
+}
+
+func TestPTYInteractiveEditPrepopulatedDefault(t *testing.T) {
+	ptmx, pts, err := pty.Open()
+	if err != nil {
+		t.Fatalf("Failed to open PTY: %v", err)
+	}
+	defer ptmx.Close()
+	defer pts.Close()
+
+	go func() {
+		_, _ = io.Copy(io.Discard, ptmx)
+	}()
+
+	var stdout syncBuffer
+	prompter := newPrompter(pts, &stdout, pts)
+	defer prompter.Close()
+
+	req := protocol.CommandRequest{
+		ID:      "test-pty-edit-default",
+		Reason:  "PTY edit test",
+		Command: "echo",
+		Args:    []string{"hello world"},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Send "e\n" to enter edit mode, then "\r" to accept pre-populated command
+	go func() {
+		if !waitForPromptOutput(&stdout, "Approve execution?", 2*time.Second) {
+			return
+		}
+		_, _ = ptmx.Write([]byte("e\n"))
+		if !waitForPromptOutput(&stdout, "Edit command", 2*time.Second) {
+			return
+		}
+		_, _ = ptmx.Write([]byte("\r"))
+	}()
+
+	decision, edited, _, err := prompter.Prompt(ctx, req)
+	if err != nil {
+		t.Fatalf("Unexpected prompt error: %v", err)
+	}
+	if decision != DecisionEdit {
+		t.Fatalf("Expected DecisionEdit, got %v", decision)
+	}
+	expected := "echo 'hello world'"
+	if edited != expected {
+		t.Errorf("Expected pre-populated default command %q, got %q", expected, edited)
+	}
+}
+
+func TestPTYInteractiveEditWithArrowAndBackspace(t *testing.T) {
+	ptmx, pts, err := pty.Open()
+	if err != nil {
+		t.Fatalf("Failed to open PTY: %v", err)
+	}
+	defer ptmx.Close()
+	defer pts.Close()
+
+	go func() {
+		_, _ = io.Copy(io.Discard, ptmx)
+	}()
+
+	var stdout syncBuffer
+	prompter := newPrompter(pts, &stdout, pts)
+	defer prompter.Close()
+
+	req := protocol.CommandRequest{
+		ID:      "test-pty-edit-arrow",
+		Reason:  "PTY edit arrow test",
+		Command: "echo",
+		Args:    []string{"cat"},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Pre-populated buffer is `echo cat`.
+	// Operator types "e\n" to enter edit mode.
+	// In edit mode:
+	// Press Backspace 3 times (deleting 'cat') -> `echo `
+	// Type 'dog' -> `echo dog`
+	// Press Enter (\r)
+	go func() {
+		if !waitForPromptOutput(&stdout, "Approve execution?", 2*time.Second) {
+			return
+		}
+		_, _ = ptmx.Write([]byte("e\n"))
+		if !waitForPromptOutput(&stdout, "Edit command", 2*time.Second) {
+			return
+		}
+		_, _ = ptmx.Write([]byte("\x7f\x7f\x7fdog\r"))
+	}()
+
+	decision, edited, _, err := prompter.Prompt(ctx, req)
+	if err != nil {
+		t.Fatalf("Unexpected prompt error: %v", err)
+	}
+	if decision != DecisionEdit {
+		t.Fatalf("Expected DecisionEdit, got %v", decision)
+	}
+	if edited != "echo dog" {
+		t.Errorf("Expected edited command 'echo dog', got %q", edited)
+	}
+}
+
+func TestPTYInteractiveEditLeftArrowInsertion(t *testing.T) {
+	ptmx, pts, err := pty.Open()
+	if err != nil {
+		t.Fatalf("Failed to open PTY: %v", err)
+	}
+	defer ptmx.Close()
+	defer pts.Close()
+
+	go func() {
+		_, _ = io.Copy(io.Discard, ptmx)
+	}()
+
+	var stdout syncBuffer
+	prompter := newPrompter(pts, &stdout, pts)
+	defer prompter.Close()
+
+	req := protocol.CommandRequest{
+		ID:      "test-pty-edit-left",
+		Reason:  "PTY edit left arrow",
+		Command: "rm",
+		Args:    []string{"file.txt"},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Pre-populated is `rm file.txt`. Length is 11.
+	// Cursor starts at end (index 11).
+	// Move left 8 times (over `file.txt` to right after `rm `).
+	// Type `-i `
+	// Buffer becomes `rm -i file.txt`.
+	// Press Enter (\r).
+	go func() {
+		if !waitForPromptOutput(&stdout, "Approve execution?", 2*time.Second) {
+			return
+		}
+		_, _ = ptmx.Write([]byte("e\n"))
+		if !waitForPromptOutput(&stdout, "Edit command", 2*time.Second) {
+			return
+		}
+		var seq []byte
+		for i := 0; i < 8; i++ {
+			seq = append(seq, []byte("\x1b[D")...)
+		}
+		seq = append(seq, []byte("-i \r")...)
+		_, _ = ptmx.Write(seq)
+	}()
+
+	decision, edited, _, err := prompter.Prompt(ctx, req)
+	if err != nil {
+		t.Fatalf("Unexpected prompt error: %v", err)
+	}
+	if decision != DecisionEdit {
+		t.Fatalf("Expected DecisionEdit, got %v", decision)
+	}
+	if edited != "rm -i file.txt" {
+		t.Errorf("Expected edited command 'rm -i file.txt', got %q", edited)
+	}
+}
+
+func TestPTYInteractiveEditHomeEnd(t *testing.T) {
+	ptmx, pts, err := pty.Open()
+	if err != nil {
+		t.Fatalf("Failed to open PTY: %v", err)
+	}
+	defer ptmx.Close()
+	defer pts.Close()
+
+	go func() {
+		_, _ = io.Copy(io.Discard, ptmx)
+	}()
+
+	var stdout syncBuffer
+	prompter := newPrompter(pts, &stdout, pts)
+	defer prompter.Close()
+
+	req := protocol.CommandRequest{
+		ID:      "test-pty-edit-home",
+		Reason:  "PTY edit home test",
+		Command: "ls",
+		Args:    []string{"-l"},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Pre-populated is `ls -l`.
+	// Press Home (\x1b[H), type "sudo " -> `sudo ls -l`
+	// Press End (\x1b[F), type " /tmp" -> `sudo ls -l /tmp`
+	// Press Enter (\r)
+	go func() {
+		if !waitForPromptOutput(&stdout, "Approve execution?", 2*time.Second) {
+			return
+		}
+		_, _ = ptmx.Write([]byte("e\n"))
+		if !waitForPromptOutput(&stdout, "Edit command", 2*time.Second) {
+			return
+		}
+		seq := []byte("\x1b[Hsudo \x1b[F /tmp\r")
+		_, _ = ptmx.Write(seq)
+	}()
+
+	decision, edited, _, err := prompter.Prompt(ctx, req)
+	if err != nil {
+		t.Fatalf("Unexpected prompt error: %v", err)
+	}
+	if decision != DecisionEdit {
+		t.Fatalf("Expected DecisionEdit, got %v", decision)
+	}
+	if edited != "sudo ls -l /tmp" {
+		t.Errorf("Expected edited command 'sudo ls -l /tmp', got %q", edited)
+	}
+}
+
+func TestPTYInteractiveEditCtrlC(t *testing.T) {
+	ptmx, pts, err := pty.Open()
+	if err != nil {
+		t.Fatalf("Failed to open PTY: %v", err)
+	}
+	defer ptmx.Close()
+	defer pts.Close()
+
+	go func() {
+		_, _ = io.Copy(io.Discard, ptmx)
+	}()
+
+	var stdout syncBuffer
+	prompter := newPrompter(pts, &stdout, pts)
+	defer prompter.Close()
+
+	req := protocol.CommandRequest{
+		ID:      "test-pty-edit-ctrlc",
+		Reason:  "PTY edit ctrl-c test",
+		Command: "rm",
+		Args:    []string{"-rf", "/"},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	go func() {
+		if !waitForPromptOutput(&stdout, "Approve execution?", 2*time.Second) {
+			return
+		}
+		_, _ = ptmx.Write([]byte("e\n"))
+		if !waitForPromptOutput(&stdout, "Edit command", 2*time.Second) {
+			return
+		}
+		_, _ = ptmx.Write([]byte("\x03")) // Ctrl+C
+	}()
+
+	decision, _, reason, err := prompter.Prompt(ctx, req)
+	if decision != DecisionReject {
+		t.Fatalf("Expected DecisionReject on Ctrl+C, got %v (err: %v)", decision, err)
+	}
+	if !strings.Contains(reason, "Cancelled") && !strings.Contains(reason, "operator") {
+		t.Errorf("Expected reject reason to mention cancellation, got %q", reason)
+	}
+}
+
+func TestPTYEmptyEditRePromptDrainBypass(t *testing.T) {
+	ptmx, pts, err := pty.Open()
+	if err != nil {
+		t.Fatalf("Failed to open PTY: %v", err)
+	}
+	defer ptmx.Close()
+	defer pts.Close()
+
+	go func() {
+		_, _ = io.Copy(io.Discard, ptmx)
+	}()
+
+	var stdout syncBuffer
+	prompter := newPrompter(pts, &stdout, pts)
+	defer prompter.Close()
+
+	req := protocol.CommandRequest{
+		ID:      "test-empty-edit-drain-bypass",
+		Reason:  "Prevent empty edit auto-approval bypass",
+		Command: "rm",
+		Args:    []string{"-rf", "/"},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	go func() {
+		if !waitForPromptOutput(&stdout, "Approve execution?", 2*time.Second) {
+			return
+		}
+		// Enter edit mode
+		_, _ = ptmx.Write([]byte("e\n"))
+		if !waitForPromptOutput(&stdout, "Edit command", 2*time.Second) {
+			return
+		}
+		// Clear line (\x15), press enter (\r), and immediately type-ahead "y\n"
+		_, _ = ptmx.Write([]byte("\x15\r\ny\n"))
+
+		// Wait for the re-prompt message "No command entered. Please choose again."
+		if !waitForPromptOutput(&stdout, "No command entered", 2*time.Second) {
+			return
+		}
+		// Give prompter 50ms to drain the queued "y\n"
+		time.Sleep(50 * time.Millisecond)
+
+		// Send explicit reject ("n\n")
+		_, _ = ptmx.Write([]byte("n\nDeclined test\n"))
+	}()
+
+	decision, _, reason, err := prompter.Prompt(ctx, req)
+	if err != nil {
+		t.Fatalf("Unexpected prompt error: %v", err)
+	}
+	// The buffered "y\n" MUST have been drained so the command was NOT auto-approved!
+	if decision != DecisionReject {
+		t.Fatalf("SECURITY VIOLATION: Empty edit allowed buffered 'y' to auto-approve! Decision was %v", decision)
+	}
+	if !strings.Contains(reason, "Declined") {
+		t.Errorf("Expected reject reason to contain 'Declined', got %q", reason)
+	}
+}
+
+func TestPTYECMA48CSIEscapesDropTilde(t *testing.T) {
+	ptmx, pts, err := pty.Open()
+	if err != nil {
+		t.Fatalf("Failed to open PTY: %v", err)
+	}
+	defer ptmx.Close()
+	defer pts.Close()
+
+	go func() {
+		_, _ = io.Copy(io.Discard, ptmx)
+	}()
+
+	var stdout syncBuffer
+	prompter := newPrompter(pts, &stdout, pts)
+	defer prompter.Close()
+
+	req := protocol.CommandRequest{
+		ID:      "test-ecma48-tilde-drop",
+		Reason:  "Ensure CSI sequence trailing tildes are not leaked into command",
+		Command: "rm",
+		Args:    []string{"-rf", "/build"},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	go func() {
+		if !waitForPromptOutput(&stdout, "Approve execution?", 2*time.Second) {
+			return
+		}
+		_, _ = ptmx.Write([]byte("e\n"))
+		if !waitForPromptOutput(&stdout, "Edit command", 2*time.Second) {
+			return
+		}
+
+		// Move left 5 characters (to between -rf and /build)
+		// Send Insert (\033[2~), PgUp (\033[5~), PgDn (\033[6~), F5 (\033[15~), SGR mouse (\033[<0;20;10M)
+		// None of these should insert '~' or leak!
+		seq := []byte("\033[D\033[D\033[D\033[D\033[D" +
+			"\033[2~" +
+			"\033[5~" +
+			"\033[6~" +
+			"\033[15~" +
+			"\033[<0;20;10M" +
+			"\r")
+		_, _ = ptmx.Write(seq)
+	}()
+
+	decision, edited, _, err := prompter.Prompt(ctx, req)
+	if err != nil {
+		t.Fatalf("Unexpected prompt error: %v", err)
+	}
+	if decision != DecisionEdit {
+		t.Fatalf("Expected DecisionEdit, got %v", decision)
+	}
+	// The original command was "rm -rf /build". If '~' leaked, it would be "rm -rf ~~~~.../build"
+	expected := "rm -rf /build"
+	if edited != expected {
+		t.Fatalf("SECURITY VIOLATION: CSI sequence leaked trailing bytes into command! Expected %q, got %q", expected, edited)
+	}
+}
+
+func TestPTYBracketedPasteNewlineHandling(t *testing.T) {
+	ptmx, pts, err := pty.Open()
+	if err != nil {
+		t.Fatalf("Failed to open PTY: %v", err)
+	}
+	defer ptmx.Close()
+	defer pts.Close()
+
+	go func() {
+		_, _ = io.Copy(io.Discard, ptmx)
+	}()
+
+	var stdout syncBuffer
+	prompter := newPrompter(pts, &stdout, pts)
+	defer prompter.Close()
+
+	req := protocol.CommandRequest{
+		ID:      "test-bracketed-paste",
+		Reason:  "Bracketed paste multiline safety",
+		Command: "echo",
+		Args:    []string{"init"},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	go func() {
+		if !waitForPromptOutput(&stdout, "Approve execution?", 2*time.Second) {
+			return
+		}
+		_, _ = ptmx.Write([]byte("e\n"))
+		if !waitForPromptOutput(&stdout, "Edit command", 2*time.Second) {
+			return
+		}
+		// Clear line (\x15), send Bracketed Paste Start (\033[200~), multiline text with newlines, Bracketed Paste End (\033[201~), then Enter (\r)
+		pasteSeq := []byte("\x15\033[200~echo line1\necho line2\r\n\033[201~\r")
+		_, _ = ptmx.Write(pasteSeq)
+	}()
+
+	decision, edited, _, err := prompter.Prompt(ctx, req)
+	if err != nil {
+		t.Fatalf("Unexpected prompt error: %v", err)
+	}
+	if decision != DecisionEdit {
+		t.Fatalf("Expected DecisionEdit, got %v", decision)
+	}
+	// In bracketed paste, newlines should be converted to space and not submit prematurely
+	if !strings.Contains(edited, "echo line1") || !strings.Contains(edited, "echo line2") {
+		t.Fatalf("Expected edited command to contain both pasted lines, got %q", edited)
+	}
+}
+
+func TestPTYEditContextTimeoutNoHangOrStolenKeystroke(t *testing.T) {
+	ptmx, pts, err := pty.Open()
+	if err != nil {
+		t.Fatalf("Failed to open PTY: %v", err)
+	}
+	defer ptmx.Close()
+	defer pts.Close()
+
+	go func() {
+		_, _ = io.Copy(io.Discard, ptmx)
+	}()
+
+	var stdout syncBuffer
+	prompter := newPrompter(pts, &stdout, pts)
+	defer prompter.Close()
+
+	req1 := protocol.CommandRequest{
+		ID:      "test-timeout-req1",
+		Reason:  "Timeout request 1",
+		Command: "rm",
+		Args:    []string{"-rf", "/"},
+	}
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+
+	go func() {
+		if !waitForPromptOutput(&stdout, "Approve execution?", 2*time.Second) {
+			return
+		}
+		_, _ = ptmx.Write([]byte("e\n"))
+		if !waitForPromptOutput(&stdout, "Edit command", 2*time.Second) {
+			return
+		}
+		// Simulate client disconnect / timeout while operator is in edit mode
+		cancel1()
+	}()
+
+	decision1, _, _, _ := prompter.Prompt(ctx1, req1)
+	if decision1 != DecisionTimeout && decision1 != DecisionReject {
+		t.Fatalf("Expected DecisionTimeout or DecisionReject on cancelled context, got %v", decision1)
+	}
+
+	// Now immediately send second prompt on the same prompter
+	req2 := protocol.CommandRequest{
+		ID:      "test-timeout-req2",
+		Reason:  "Followup request 2",
+		Command: "echo",
+		Args:    []string{"recovered"},
+	}
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+
+	go func() {
+		if !waitForPromptOutput(&stdout, "Followup request 2", 2*time.Second) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+		_, _ = ptmx.Write([]byte("y\n"))
+	}()
+
+	decision2, _, _, err := prompter.Prompt(ctx2, req2)
+	if err != nil {
+		t.Fatalf("Unexpected prompt 2 error: %v", err)
+	}
+	if decision2 != DecisionApprove {
+		t.Fatalf("Expected prompt 2 to succeed with DecisionApprove, got %v", decision2)
+	}
+}
+
+func TestPrompterConcurrentCloseRace(t *testing.T) {
+	var stdout syncBuffer
+	r, w := io.Pipe()
+	prompter := NewStreamPrompter(r, &stdout)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = prompter.Close()
+		}()
+	}
+	wg.Wait()
+	_ = w.Close()
+}
+
+func TestPTYLongCommandHorizontalScrolling(t *testing.T) {
+	ptmx, pts, err := pty.Open()
+	if err != nil {
+		t.Fatalf("Failed to open PTY: %v", err)
+	}
+	defer ptmx.Close()
+	defer pts.Close()
+
+	go func() {
+		_, _ = io.Copy(io.Discard, ptmx)
+	}()
+
+	var stdout syncBuffer
+	prompter := newPrompter(pts, &stdout, pts)
+	defer prompter.Close()
+
+	// 150-char command that easily exceeds 80 columns
+	longArg := strings.Repeat("A", 140)
+	req := protocol.CommandRequest{
+		ID:      "test-long-command-scroll",
+		Reason:  "Horizontal scrolling test",
+		Command: "echo",
+		Args:    []string{longArg},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	go func() {
+		if !waitForPromptOutput(&stdout, "Approve execution?", 2*time.Second) {
+			return
+		}
+		_, _ = ptmx.Write([]byte("e\n"))
+		if !waitForPromptOutput(&stdout, "Edit command", 2*time.Second) {
+			return
+		}
+		// Press Enter to submit
+		_, _ = ptmx.Write([]byte("\r"))
+	}()
+
+	decision, edited, _, err := prompter.Prompt(ctx, req)
+	if err != nil {
+		t.Fatalf("Unexpected prompt error: %v", err)
+	}
+	if decision != DecisionEdit {
+		t.Fatalf("Expected DecisionEdit, got %v", decision)
+	}
+	if !strings.Contains(edited, longArg) {
+		t.Fatalf("Expected edited command to contain full long argument")
+	}
+
+	// Verify that the redraw line contains horizontal scroll indicator '<'
+	output := stdout.String()
+	if !strings.Contains(output, "> <") {
+		t.Errorf("Expected output to contain left-scroll indicator '> <', got: %s", output)
+	}
+}
+
+func TestPromptCommandExceedsMaxEditRunesRefusesEdit(t *testing.T) {
+	ptmx, pts, err := pty.Open()
+	if err != nil {
+		t.Fatalf("Failed to open PTY: %v", err)
+	}
+	defer ptmx.Close()
+	defer pts.Close()
+
+	go func() {
+		_, _ = io.Copy(io.Discard, ptmx)
+	}()
+
+	var stdout syncBuffer
+	prompter := newPrompter(pts, &stdout, pts)
+	defer prompter.Close()
+
+	// Command exceeding maxEditRunes (64 * 1024)
+	giantArg := strings.Repeat("x", maxEditRunes+50)
+	req := protocol.CommandRequest{
+		ID:      "test-giant-command",
+		Reason:  "Giant command edit refusal",
+		Command: "echo",
+		Args:    []string{giantArg},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	go func() {
+		if !waitForPromptOutput(&stdout, "Approve execution?", 2*time.Second) {
+			return
+		}
+		// Attempt to edit
+		_, _ = ptmx.Write([]byte("e\n"))
+		// Wait for refusal warning
+		if !waitForPromptOutput(&stdout, "exceeds maximum interactive edit length", 2*time.Second) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+		// Now choose run 'y'
+		_, _ = ptmx.Write([]byte("y\n"))
+	}()
+
+	decision, edited, _, err := prompter.Prompt(ctx, req)
+	if err != nil {
+		t.Fatalf("Unexpected prompt error: %v", err)
+	}
+	if decision != DecisionApprove {
+		t.Fatalf("Expected DecisionApprove after edit was refused, got %v", decision)
+	}
+	if edited != "" {
+		t.Errorf("Expected edited to be empty on direct approval, got %q", edited)
+	}
+}
+
+func TestLineBufOverflowRejects(t *testing.T) {
+	var stdout syncBuffer
+	r, w := io.Pipe()
+	prompter := NewStreamPrompter(r, &stdout)
+	defer prompter.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		// Write a 70 KB line without newline, followed by newline
+		chunk := strings.Repeat("A", 70*1024)
+		_, _ = w.Write([]byte(chunk + "\n"))
+	}()
+
+	req := protocol.CommandRequest{
+		ID:      "test-line-overflow",
+		Reason:  "Line overflow test",
+		Command: "echo",
+		Args:    []string{"hi"},
+	}
+
+	decision, _, reason, err := prompter.Prompt(ctx, req)
+	if decision != DecisionReject {
+		t.Fatalf("Expected DecisionReject for overflow line, got %v", decision)
+	}
+	if err == nil || !strings.Contains(err.Error(), "exceeds maximum length") {
+		t.Errorf("Expected 'exceeds maximum length' error, got %v (reason: %q)", err, reason)
+	}
+}
+
+func TestPTYLoneUTF8LeadByteTimeoutNoRaceOrStolenKeystroke(t *testing.T) {
+	ptmx, pts, err := pty.Open()
+	if err != nil {
+		t.Fatalf("Failed to open PTY: %v", err)
+	}
+	defer ptmx.Close()
+	defer pts.Close()
+
+	go func() {
+		_, _ = io.Copy(io.Discard, ptmx)
+	}()
+
+	var stdout syncBuffer
+	prompter := newPrompter(pts, &stdout, pts)
+	defer prompter.Close()
+
+	req1 := protocol.CommandRequest{
+		ID:      "test-lone-utf8-req1",
+		Reason:  "Lone UTF8 test 1",
+		Command: "rm",
+		Args:    []string{"-rf", "/"},
+	}
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+
+	go func() {
+		if !waitForPromptOutput(&stdout, "Approve execution?", 2*time.Second) {
+			return
+		}
+		_, _ = ptmx.Write([]byte("e\n"))
+		if !waitForPromptOutput(&stdout, "Edit command", 2*time.Second) {
+			return
+		}
+		// Write lone UTF-8 lead byte (0xC3) without continuation bytes
+		_, _ = ptmx.Write([]byte{0xC3})
+		time.Sleep(20 * time.Millisecond)
+		// Cancel ctx1 while lone lead byte is pending
+		cancel1()
+	}()
+
+	decision1, _, _, _ := prompter.Prompt(ctx1, req1)
+	if decision1 != DecisionTimeout && decision1 != DecisionReject {
+		t.Fatalf("Expected prompt 1 to terminate with Timeout/Reject, got %v", decision1)
+	}
+
+	// Immediately run prompt 2
+	req2 := protocol.CommandRequest{
+		ID:      "test-lone-utf8-req2",
+		Reason:  "Lone UTF8 followup req2",
+		Command: "echo",
+		Args:    []string{"recovered"},
+	}
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+
+	go func() {
+		if !waitForPromptOutput(&stdout, "Lone UTF8 followup req2", 2*time.Second) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+		_, _ = ptmx.Write([]byte("y\n"))
+	}()
+
+	decision2, _, _, err := prompter.Prompt(ctx2, req2)
+	if err != nil {
+		t.Fatalf("Unexpected prompt 2 error: %v", err)
+	}
+	if decision2 != DecisionApprove {
+		t.Fatalf("Expected prompt 2 to approve cleanly, got %v", decision2)
+	}
+}
+
+func TestClosedPipePOLLHUPImmediateRejectAndCloseUnblocks(t *testing.T) {
+	// Part A: Closed pipe POLLHUP
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Failed to create pipe: %v", err)
+	}
+	var stdout syncBuffer
+	prompter := newPrompter(r, &stdout, r)
+
+	// Close write end immediately
+	_ = w.Close()
+
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel1()
+
+	req1 := protocol.CommandRequest{
+		ID:      "test-pollhup-req",
+		Reason:  "POLLHUP test",
+		Command: "echo",
+		Args:    []string{"eof"},
+	}
+
+	start := time.Now()
+	decision, _, _, _ := prompter.Prompt(ctx1, req1)
+	elapsed := time.Since(start)
+	if decision != DecisionReject {
+		t.Fatalf("Expected DecisionReject on closed pipe POLLHUP, got %v", decision)
+	}
+	if elapsed > 1*time.Second {
+		t.Fatalf("Prompt took %v to detect POLLHUP EOF, expected immediate return (<1s)", elapsed)
+	}
+	_ = prompter.Close()
+
+	// Part B: prompter.Close() unblocks active Prompt()
+	r2, w2, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Failed to create pipe: %v", err)
+	}
+	defer w2.Close()
+
+	var stdout2 syncBuffer
+	prompter2 := newPrompter(r2, &stdout2, r2)
+
+	doneCh := make(chan ApprovalDecision, 1)
+	go func() {
+		dec, _, _, _ := prompter2.Prompt(context.Background(), req1)
+		doneCh <- dec
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	_ = prompter2.Close()
+
+	select {
+	case dec := <-doneCh:
+		if dec != DecisionReject {
+			t.Fatalf("Expected DecisionReject on prompter.Close(), got %v", dec)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("prompter.Close() hung and failed to unblock active Prompt()")
+	}
+}
+
+func TestPTYBracketedPasteEmitAndCRLFFilter(t *testing.T) {
+	ptmx, pts, err := pty.Open()
+	if err != nil {
+		t.Fatalf("Failed to open PTY: %v", err)
+	}
+	defer ptmx.Close()
+	defer pts.Close()
+
+	go func() {
+		_, _ = io.Copy(io.Discard, ptmx)
+	}()
+
+	var stdout syncBuffer
+	prompter := newPrompter(pts, &stdout, pts)
+	defer prompter.Close()
+
+	req := protocol.CommandRequest{
+		ID:      "test-bracketed-paste-filter",
+		Reason:  "Bracketed paste filter test",
+		Command: "echo",
+		Args:    []string{"init"},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	go func() {
+		if !waitForPromptOutput(&stdout, "Approve execution?", 2*time.Second) {
+			return
+		}
+		_, _ = ptmx.Write([]byte("e\n"))
+		if !waitForPromptOutput(&stdout, "Edit command", 2*time.Second) {
+			return
+		}
+
+		// Clear line (\x15), send Bracketed Paste Start (\033[200~),
+		// text with CRLF and ignored control bytes (\x07, \x04), Bracketed Paste End (\033[201~), then Enter (\r)
+		pasteSeq := []byte("\x15\033[200~echo line1\r\necho line2\r\n\x07\x04\033[201~\r")
+		_, _ = ptmx.Write(pasteSeq)
+	}()
+
+	decision, edited, _, err := prompter.Prompt(ctx, req)
+	if err != nil {
+		t.Fatalf("Unexpected prompt error: %v", err)
+	}
+	if decision != DecisionEdit {
+		t.Fatalf("Expected DecisionEdit, got %v", decision)
+	}
+	expected := "echo line1 echo line2"
+	if edited != expected {
+		t.Fatalf("Expected edited command %q, got %q", expected, edited)
+	}
+
+	// Verify terminal output contains \033[?2004h and \033[?2004l
+	out := stdout.String()
+	if !strings.Contains(out, "\033[?2004h") {
+		t.Errorf("Expected stdout to contain bracketed paste enable sequence \\033[?2004h")
+	}
+	if !strings.Contains(out, "\033[?2004l") {
+		t.Errorf("Expected stdout to contain bracketed paste disable sequence \\033[?2004l")
+	}
+}
+
+func TestPTYWideCJKRunesInRedraw(t *testing.T) {
+	ptmx, pts, err := pty.Open()
+	if err != nil {
+		t.Fatalf("Failed to open PTY: %v", err)
+	}
+	defer ptmx.Close()
+	defer pts.Close()
+
+	go func() {
+		_, _ = io.Copy(io.Discard, ptmx)
+	}()
+
+	var stdout syncBuffer
+	prompter := newPrompter(pts, &stdout, pts)
+	defer prompter.Close()
+
+	// 60 CJK ideographs = 120 display columns
+	cjkArg := strings.Repeat("中", 60)
+	req := protocol.CommandRequest{
+		ID:      "test-cjk-redraw",
+		Reason:  "CJK redraw test",
+		Command: "echo",
+		Args:    []string{cjkArg},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	go func() {
+		if !waitForPromptOutput(&stdout, "Approve execution?", 2*time.Second) {
+			return
+		}
+		_, _ = ptmx.Write([]byte("e\n"))
+		if !waitForPromptOutput(&stdout, "Edit command", 2*time.Second) {
+			return
+		}
+		// Move cursor left 10 runes
+		for i := 0; i < 10; i++ {
+			_, _ = ptmx.Write([]byte("\033[D"))
+		}
+		time.Sleep(50 * time.Millisecond)
+		// Submit
+		_, _ = ptmx.Write([]byte("\r"))
+	}()
+
+	decision, edited, _, err := prompter.Prompt(ctx, req)
+	if err != nil {
+		t.Fatalf("Unexpected prompt error: %v", err)
+	}
+	if decision != DecisionEdit {
+		t.Fatalf("Expected DecisionEdit, got %v", decision)
+	}
+	if !strings.Contains(edited, cjkArg) {
+		t.Fatalf("Expected edited command to contain full CJK argument")
+	}
+
+	// Verify that redraw output contains horizontal scroll indicators '<' or '>'
+	out := stdout.String()
+	if !strings.Contains(out, "> <") && !strings.Contains(out, ">") {
+		t.Errorf("Expected redraw output to contain horizontal scroll marker '<' or '>', got: %s", out)
+	}
+}
+
+func TestPTYLargeCommandRedrawPerformanceAndBackspaceLeftPull(t *testing.T) {
+	ptmx, pts, err := pty.Open()
+	if err != nil {
+		t.Fatalf("Failed to open PTY: %v", err)
+	}
+	defer ptmx.Close()
+	defer pts.Close()
+
+	go func() {
+		_, _ = io.Copy(io.Discard, ptmx)
+	}()
+
+	var stdout syncBuffer
+	prompter := newPrompter(pts, &stdout, pts)
+	defer prompter.Close()
+
+	// 60,000-rune command
+	largeArg := strings.Repeat("a", 60000)
+	req := protocol.CommandRequest{
+		ID:      "test-large-redraw-perf",
+		Reason:  "Large command redraw performance test",
+		Command: "echo",
+		Args:    []string{largeArg},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	doneCh := make(chan time.Duration, 1)
+
+	go func() {
+		if !waitForPromptOutput(&stdout, "Approve execution?", 2*time.Second) {
+			return
+		}
+		t0 := time.Now()
+		// Enter edit mode
+		_, _ = ptmx.Write([]byte("e\n"))
+		if !waitForPromptOutput(&stdout, "Edit command", 2*time.Second) {
+			return
+		}
+		// Press Backspace 5 times at the end of the 60,000-char buffer and hit Enter
+		_, _ = ptmx.Write([]byte("\x7f\x7f\x7f\x7f\x7f\r"))
+		doneCh <- time.Since(t0)
+	}()
+
+	decision, edited, _, err := prompter.Prompt(ctx, req)
+	if err != nil {
+		t.Fatalf("Unexpected prompt error: %v", err)
+	}
+	if decision != DecisionEdit {
+		t.Fatalf("Expected DecisionEdit, got %v", decision)
+	}
+	expectedLen := len("echo ") + 60000 - 5
+	if len(edited) != expectedLen {
+		t.Fatalf("Expected edited length %d, got %d", expectedLen, len(edited))
+	}
+
+	select {
+	case dur := <-doneCh:
+		if dur > 500*time.Millisecond {
+			t.Errorf("Interactive edit on 60,000-rune command took %v (> 500ms), potential O(N^2) redraw freeze", dur)
+		}
+	default:
+	}
+
+	// Verify that the viewport after backspacing still has '<' left indicator and is populated
+	out := stdout.String()
+	if !strings.Contains(out, "> <") {
+		t.Errorf("Expected stdout to retain left-scroll indicator '> <' after backspacing")
+	}
+}
+
+func TestPTYEditCtrlCEnforcesLastAbortCooldownBeforeQueuedRequest(t *testing.T) {
+	ptmx, pts, err := pty.Open()
+	if err != nil {
+		t.Fatalf("Failed to open PTY: %v", err)
+	}
+	defer ptmx.Close()
+	defer pts.Close()
+
+	go func() {
+		_, _ = io.Copy(io.Discard, ptmx)
+	}()
+
+	var stdout syncBuffer
+	prompter := newPrompter(pts, &stdout, pts)
+	defer prompter.Close()
+
+	req1 := protocol.CommandRequest{
+		ID:      "test-req-1",
+		Reason:  "Request 1",
+		Command: "echo",
+		Args:    []string{"first"},
+	}
+
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel1()
+
+	go func() {
+		if !waitForPromptOutput(&stdout, "Approve execution?", 2*time.Second) {
+			return
+		}
+		// Enter edit mode then press Ctrl+C
+		_, _ = ptmx.Write([]byte("e\n"))
+		if !waitForPromptOutput(&stdout, "Edit command", 2*time.Second) {
+			return
+		}
+		_, _ = ptmx.Write([]byte("\x03"))
+	}()
+
+	decision1, _, _, err1 := prompter.Prompt(ctx1, req1)
+	if err1 != nil {
+		t.Fatalf("Unexpected prompt 1 error: %v", err1)
+	}
+	if decision1 != DecisionReject {
+		t.Fatalf("Expected DecisionReject for Ctrl+C, got %v", decision1)
+	}
+
+	prompter.mu.Lock()
+	abortTime := prompter.lastAbortTime
+	prompter.mu.Unlock()
+
+	if abortTime.IsZero() || time.Since(abortTime) > 500*time.Millisecond {
+		t.Fatalf("Expected lastAbortTime to be set recently upon edit Ctrl+C, got %v", abortTime)
+	}
+
+	req2 := protocol.CommandRequest{
+		ID:      "test-req-2",
+		Reason:  "Request 2",
+		Command: "echo",
+		Args:    []string{"second"},
+	}
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel2()
+
+	// Write 'y\n' immediately into ptmx during the 300ms cooldown window.
+	// DrainPendingInput in Prompt 2 MUST drain it and wait for cooldown.
+	_, _ = ptmx.Write([]byte("y\n"))
+
+	// Then after 350ms from abortTime, write 'n\n' which should be the actual decision.
+	go func() {
+		time.Sleep(350 * time.Millisecond)
+		_, _ = ptmx.Write([]byte("n\n"))
+	}()
+
+	start2 := time.Now()
+	decision2, _, _, _ := prompter.Prompt(ctx2, req2)
+	elapsed2 := time.Since(start2)
+
+	// Since 'y\n' was sent during cooldown, it must have been drained, so Prompt 2
+	// should receive 'n\n' and reject rather than auto-approving with 'y\n'!
+	if decision2 != DecisionReject {
+		t.Fatalf("SECURITY VIOLATION: Stale keystrokes during edit abort cooldown auto-approved request 2 (got %v)", decision2)
+	}
+	if elapsed2 < 200*time.Millisecond {
+		t.Errorf("Expected Prompt 2 to respect 300ms cooldown window, but completed in %v", elapsed2)
+	}
+}
+
+func TestPTYMultiESCPasteSequenceRecognition(t *testing.T) {
+	ptmx, pts, err := pty.Open()
+	if err != nil {
+		t.Fatalf("Failed to open PTY: %v", err)
+	}
+	defer ptmx.Close()
+	defer pts.Close()
+
+	go func() {
+		_, _ = io.Copy(io.Discard, ptmx)
+	}()
+
+	var stdout syncBuffer
+	prompter := newPrompter(pts, &stdout, pts)
+	defer prompter.Close()
+
+	req := protocol.CommandRequest{
+		ID:      "test-multiesc-paste",
+		Reason:  "Multi ESC paste test",
+		Command: "echo",
+		Args:    []string{"initial"},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		if !waitForPromptOutput(&stdout, "Approve execution?", 2*time.Second) {
+			return
+		}
+		_, _ = ptmx.Write([]byte("e\n"))
+		if !waitForPromptOutput(&stdout, "Edit command", 2*time.Second) {
+			return
+		}
+		// Send multiple ESC bytes before bracketed paste start and end
+		pasteSeq := []byte("\x15\033\033\033[200~echo multiesc\033\033[201~\r")
+		_, _ = ptmx.Write(pasteSeq)
+	}()
+
+	decision, edited, _, err := prompter.Prompt(ctx, req)
+	if err != nil {
+		t.Fatalf("Unexpected prompt error: %v", err)
+	}
+	if decision != DecisionEdit {
+		t.Fatalf("Expected DecisionEdit, got %v", decision)
+	}
+	if edited != "echo multiesc" {
+		t.Fatalf("Expected edited command %q, got %q", "echo multiesc", edited)
+	}
+}
+
+func TestPTYWideSymbolColumnBounds(t *testing.T) {
+	// Verify runeDisplayWidth classifies wide/narrow symbols accurately
+	if runeDisplayWidth('✓') != 1 {
+		t.Errorf("Expected '✓' (U+2713) to be 1 display column, got %d", runeDisplayWidth('✓'))
+	}
+	if runeDisplayWidth('⬛') != 2 {
+		t.Errorf("Expected '⬛' (U+2B1B) to be 2 display columns, got %d", runeDisplayWidth('⬛'))
+	}
+	if runeDisplayWidth('⬜') != 2 {
+		t.Errorf("Expected '⬜' (U+2B1C) to be 2 display columns, got %d", runeDisplayWidth('⬜'))
+	}
+	if runeDisplayWidth('⭐') != 2 {
+		t.Errorf("Expected '⭐' (U+2B50) to be 2 display columns, got %d", runeDisplayWidth('⭐'))
+	}
+	if runeDisplayWidth('⭕') != 2 {
+		t.Errorf("Expected '⭕' (U+2B55) to be 2 display columns, got %d", runeDisplayWidth('⭕'))
+	}
+
+	ptmx, pts, err := pty.Open()
+	if err != nil {
+		t.Fatalf("Failed to open PTY: %v", err)
+	}
+	defer ptmx.Close()
+	defer pts.Close()
+
+	go func() {
+		_, _ = io.Copy(io.Discard, ptmx)
+	}()
+
+	var stdout syncBuffer
+	prompter := newPrompter(pts, &stdout, pts)
+	defer prompter.Close()
+
+	// 60 wide black square symbols = 120 display columns
+	wideArg := strings.Repeat("⬛", 60)
+	req := protocol.CommandRequest{
+		ID:      "test-wide-symbol-bounds",
+		Reason:  "Wide symbol bounds test",
+		Command: "echo",
+		Args:    []string{wideArg},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		if !waitForPromptOutput(&stdout, "Approve execution?", 2*time.Second) {
+			return
+		}
+		_, _ = ptmx.Write([]byte("e\n"))
+		if !waitForPromptOutput(&stdout, "Edit command", 2*time.Second) {
+			return
+		}
+		_, _ = ptmx.Write([]byte("\r"))
+	}()
+
+	decision, edited, _, err := prompter.Prompt(ctx, req)
+	if err != nil {
+		t.Fatalf("Unexpected prompt error: %v", err)
+	}
+	if decision != DecisionEdit {
+		t.Fatalf("Expected DecisionEdit, got %v", decision)
+	}
+	if !strings.Contains(edited, wideArg) {
+		t.Fatalf("Expected edited command to contain full wide argument")
+	}
+
+	// Verify horizontal scroll indicator '<' is emitted for wide symbols
+	out := stdout.String()
+	if !strings.Contains(out, "> <") {
+		t.Errorf("Expected redraw output to contain horizontal scroll marker '> <' for wide symbols")
 	}
 }

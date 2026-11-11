@@ -12,7 +12,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -385,13 +384,6 @@ func (s *Server) processExec(conn net.Conn, br *bufio.Reader, req protocol.Comma
 
 	// For security, reject any request attempting to supply custom environment variables
 	if len(req.Env) > 0 {
-		sanitizedKeys := make([]string, 0, len(req.Env))
-		for k := range req.Env {
-			sanitizedKeys = append(sanitizedKeys, protocol.SanitizeTerminalText(k))
-		}
-		sort.Strings(sanitizedKeys)
-		fmt.Fprintf(s.executor.out, "⚠️  Rejected request %s: agent attempted to set environment variables [%s]\n",
-			protocol.SanitizeTerminalText(req.ID), strings.Join(sanitizedKeys, ", "))
 		return rejectResp(req.ID, "Custom environment variables are forbidden for security reasons", start)
 	}
 
@@ -498,6 +490,16 @@ func (s *Server) processExec(conn net.Conn, br *bufio.Reader, req protocol.Comma
 	defer execCancel()
 
 	if decision == DecisionEdit {
+		if edited == protocol.FormatCommand(req.Command, req.Args) {
+			return s.executor.Execute(execCtx, ExecOptions{
+				ID:              req.ID,
+				Command:         req.Command,
+				Args:            req.Args,
+				Cwd:             req.Cwd,
+				ModifiedCommand: "",
+				StartTime:       start,
+			})
+		}
 		return s.executor.ExecuteShell(execCtx, req.ID, edited, req.Cwd, start)
 	}
 
