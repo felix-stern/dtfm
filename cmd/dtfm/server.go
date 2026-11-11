@@ -253,15 +253,20 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 		switch env.Type {
 		case protocol.TypePing:
+			var pingReq protocol.PingRequest
+			_ = json.Unmarshal(env.Data, &pingReq)
 			// Ping is handled immediately without acquiring approval lock
 			hostname, _ := os.Hostname()
 			resp := protocol.PingResponse{
+				ID:        pingReq.ID,
 				Active:    true,
 				User:      protocol.CurrentUser(),
 				Hostname:  hostname,
 				Timestamp: time.Now(),
 			}
-			_ = writeEnvelope(conn, encoder, protocol.TypePingResp, resp, defaultWriteTimeout)
+			if err := writeEnvelope(conn, encoder, protocol.TypePingResp, resp, defaultWriteTimeout); err != nil {
+				return
+			}
 
 		case protocol.TypeExec:
 			var req protocol.CommandRequest
@@ -269,7 +274,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 				_ = writeEnvelope(conn, encoder, protocol.TypeError, protocol.ErrorPayload{
 					Message: fmt.Sprintf("invalid exec payload: %v", err),
 				}, defaultWriteTimeout)
-				continue
+				return
 			}
 
 			// Process exec with queue timeout, disconnect watcher, and semaphore
@@ -277,18 +282,23 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 			if err := writeEnvelope(conn, encoder, protocol.TypeExecResp, resp, defaultExecRespTimeout); err != nil {
 				fmt.Fprintf(os.Stderr, "dtfm: failed to send exec response to agent: %v\n", err)
+				return
 			}
 
 		default:
 			_ = writeEnvelope(conn, encoder, protocol.TypeError, protocol.ErrorPayload{
 				Message: fmt.Sprintf("unknown request type: %s", env.Type),
 			}, defaultWriteTimeout)
+			return
 		}
 	}
 }
 
 // isSocketClosed checks if the socket has received a close event (POLLHUP/POLLRDHUP/POLLERR).
 func isSocketClosed(conn net.Conn) bool {
+	if dc, ok := conn.(interface{ IsClosedOrEOF() bool }); ok {
+		return dc.IsClosedOrEOF()
+	}
 	sc, ok := conn.(syscall.Conn)
 	if !ok {
 		return false

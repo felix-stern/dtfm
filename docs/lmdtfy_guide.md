@@ -79,7 +79,7 @@ Static binaries can be fetched directly from `https://github.com/iinozemtsev-lab
 | macOS | Apple Silicon (arm64) | `lmdtfy-darwin-arm64` |
 | macOS | Intel (amd64) | `lmdtfy-darwin-amd64` |
 
-Reproducible tarball archives containing both `dtfm` and `lmdtfy` alongside `README.md`, `LICENSE`, and `CHANGELOG.md` are also published as `dtfm_<version>_<os>_<arch>.tar.gz` with cryptographic checksums in `SHA256SUMS`.
+Reproducible tarball archives containing `dtfm`, `lmdtfy`, and `relay` alongside `README.md`, `LICENSE`, and `CHANGELOG.md` are also published as `dtfm_<version>_<os>_<arch>.tar.gz` with cryptographic checksums in `SHA256SUMS`.
 
 ---
 
@@ -88,7 +88,7 @@ Reproducible tarball archives containing both `dtfm` and `lmdtfy` alongside `REA
 Before attempting to dispatch commands, agents should verify whether an active human operator listening session is available:
 
 ```bash
-lmdtfy ping
+lmdtfy ping [--socket <path>] [--relay <token-or-url>] [--relay-url <url>]
 ```
 
 ### Ping Exit Codes
@@ -125,9 +125,19 @@ lmdtfy exec --why "<reason>" [options] -- <command> [args...]
 ### Options
 
 - `--why "<reason>"` (**Required**): A plain-English explanation of why the command is needed, what effect it will have, and why agent execution alone is insufficient. Requests with missing or empty `--why` are rejected immediately.
+- `--relay <token-or-url>`: Agent Magic Link (`https://dtfm.dev/c/<session>#<key>`) or session pairing token (`<session>#<key>`) to connect to an operator workstation over the zero-database WebSocket relay with authenticated AES-256-GCM End-to-End Encryption. (Can also be supplied via `LMDTFY_RELAY` environment variable).
+- `--relay-url <url>`: Override the default WebSocket relay URL (defaults to `wss://relay.dtfm.dev/ws` or inferred from the Magic Link URL). (Can also be supplied via `LMDTFY_RELAY_URL` environment variable).
 - `--timeout <sec>`: Bounding timeout in seconds bounding operator review and command execution *separately* (default: `300` seconds / 5 minutes; maximum `86400`; worst-case wall-clock wait `~2x` timeout).
 - `--cwd <path>`: Working directory on the target execution host (defaults to `dtfm`'s working directory).
-- `--socket <path>`: Custom Unix domain socket path (defaults to `/run/user/<uid>/lmdtfy.sock` on Linux, `~/.lmdtfy.sock` on macOS).
+- `--socket <path>`: Custom Unix domain socket path (defaults to `/run/user/<uid>/lmdtfy.sock` on Linux, `~/.lmdtfy.sock` on macOS). (Can also be supplied via `LMDTFY_SOCKET` environment variable).
+
+### Environment Variables
+
+| Variable | Flag Equivalent | Description |
+|---|---|---|
+| `LMDTFY_SOCKET` | `--socket <path>` | Path to the Unix domain socket for local/SSH forwarding mode. |
+| `LMDTFY_RELAY` | `--relay <token-or-url>` | Agent Magic Link URL or pairing token (`<session>#<key>`) for E2EE relay mode. |
+| `LMDTFY_RELAY_URL` | `--relay-url <url>` | Override endpoint for the WebSocket relay server (default: `wss://relay.dtfm.dev/ws`). |
 
 ### Invocation Examples
 

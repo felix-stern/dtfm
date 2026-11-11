@@ -116,7 +116,7 @@ When triggered, [`.github/workflows/release.yml`](../.github/workflows/release.y
    Inspects all compiled Linux binaries with `readelf -l` to assert zero `INTERP` or `DYNAMIC` sections, guaranteeing portable, dependency-free static binaries.
 
 8. **Reproducible Packaging & Checksums**:
-   Packages tarballs (`dtfm_<VERSION>_<OS>_<ARCH>.tar.gz`) containing `dtfm`, `lmdtfy`, `README.md`, `LICENSE`, and `CHANGELOG.md` with standardized `0:0` UID/GID ownership and `SOURCE_DATE_EPOCH` timestamps. Generates cryptographic `SHA256SUMS`.
+   Packages tarballs (`dtfm_<VERSION>_<OS>_<ARCH>.tar.gz`) containing `dtfm`, `lmdtfy`, `relay`, `README.md`, `LICENSE`, and `CHANGELOG.md` with standardized `0:0` UID/GID ownership and `SOURCE_DATE_EPOCH` timestamps. Generates cryptographic `SHA256SUMS`.
 
 ### Phase 2: Live Release Publishing (`publish`)
 
@@ -157,4 +157,5 @@ sha256sum --ignore-missing -c SHA256SUMS
 tar -xzf dtfm_0.2.0_linux_amd64.tar.gz
 ./dtfm --version
 ./lmdtfy --version
+./relay --version
 ```
