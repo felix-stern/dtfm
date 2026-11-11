@@ -61,8 +61,10 @@ jobs:
             go test -v -race ./...
           fi
 
-      - name: Run changelog extractor tests
-        run: python3 -W error scripts/test_extract_changelog.py
+      - name: Run changelog helper tests
+        run: |
+          python3 -W error scripts/test_extract_changelog.py
+          python3 -W error scripts/test_finalize_changelog.py
 
       - name: Build local binaries
         run: make build

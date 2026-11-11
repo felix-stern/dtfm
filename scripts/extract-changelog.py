@@ -6,6 +6,9 @@ import sys
 from pathlib import Path
 
 
+BOTTOM_LINK_LOOKAHEAD = r"^\[(?:Unreleased|v?\d+\.\d+\.\d+[^\]]*)\]:[ \t]*https?://"
+
+
 def extract_notes(changelog_path: Path, tag: str) -> str:
     if not changelog_path.is_file():
         return ""
@@ -18,7 +21,10 @@ def extract_notes(changelog_path: Path, tag: str) -> str:
 
     # Line-anchored match for ## [0.1.0] or ## [v0.1.0] header with optional release date
     # Lookahead stops cleanly at the next level-2 heading (^## ), bottom link reference definition, or EOF
-    pattern = rf"^## \[(?:v)?{re.escape(version)}\][^\n]*(?:\n|$)(.*?)(?=^## |^\[\S+\]:\s*https?://|\Z)"
+    pattern = (
+        rf"^## \[(?:v)?{re.escape(version)}\][^\n]*(?:\n|$)(.*?)"
+        rf"(?=^## |{BOTTOM_LINK_LOOKAHEAD}|\Z)"
+    )
     match = re.search(pattern, content, re.DOTALL | re.MULTILINE)
     if match:
         return match.group(1).strip()
