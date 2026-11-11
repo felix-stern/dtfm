@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -942,7 +944,7 @@ func TestServerShutdownDuringActivePromptAndIdleConn(t *testing.T) {
 		t.Fatalf("Failed to listen: %v", err)
 	}
 
-	promptCalled := make(chan struct{})
+	promptCalled := make(chan struct{}, 1)
 	prompter := &mockPrompter{
 		called: promptCalled,
 		delay:  10 * time.Second,
@@ -1237,5 +1239,104 @@ func TestServerUnchangedEditDirectExecution(t *testing.T) {
 	// Execution banner should be "⚡ Executing: echo direct-exec-unchanged", NOT "⚡ Executing (edited):"
 	if !strings.Contains(outBuf.String(), "⚡ Executing: echo direct-exec-unchanged") {
 		t.Errorf("Expected direct execution banner, got: %s", outBuf.String())
+	}
+}
+
+type mockRelayConn struct {
+	net.Conn
+	closed atomic.Bool
+}
+
+func (m *mockRelayConn) IsClosedOrEOF() bool {
+	return m.closed.Load()
+}
+
+func TestWatchDisconnectRelayConnFailClosedWithBufferedData(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	rc := &mockRelayConn{Conn: c1}
+
+	// Write data to pipe so bufio.Reader has buffered bytes
+	go func() {
+		_, _ = c2.Write([]byte("buffered trailing byte\n"))
+	}()
+
+	br := bufio.NewReader(rc)
+	// Peek so bytes are in br.Buffered()
+	_, err := br.Peek(5)
+	if err != nil {
+		t.Fatalf("Peek failed: %v", err)
+	}
+	if br.Buffered() == 0 {
+		t.Fatal("expected br.Buffered() > 0")
+	}
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	stop, disconnected := watchDisconnect(rc, br, cancel, context.Background())
+	defer stop()
+
+	// Simulate disconnect on RelayConn while buffer is full
+	rc.closed.Store(true)
+
+	select {
+	case <-disconnected:
+		// Success: watchDisconnect triggered fail-closed via IsClosedOrEOF()
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("watchDisconnect failed to detect disconnect on RelayConn with buffered data")
+	}
+
+	if !errors.Is(context.Cause(ctx), ErrClientDisconnected) {
+		t.Fatalf("expected ErrClientDisconnected, got: %v", context.Cause(ctx))
+	}
+}
+
+type failWriteConn struct {
+	net.Conn
+	closed atomic.Bool
+}
+
+func (c *failWriteConn) Write(p []byte) (n int, err error) {
+	return 0, errors.New("simulated write failure")
+}
+
+func (c *failWriteConn) Close() error {
+	c.closed.Store(true)
+	return c.Conn.Close()
+}
+
+func TestServerWriteEnvelopeErrorImmediateDisconnect(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+
+	fwc := &failWriteConn{Conn: c1}
+	defer fwc.Close()
+
+	s := NewServer(nil, nil)
+
+	go func() {
+		enc := json.NewEncoder(c2)
+		_ = enc.Encode(protocol.Envelope{
+			Type: protocol.TypePing,
+			Data: []byte(`{"id":"test-ping-fail-write"}`),
+		})
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		s.handleConnection(fwc)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success: handleConnection exited immediately upon writeEnvelope failure
+	case <-time.After(time.Second):
+		t.Fatal("handleConnection blocked instead of immediately returning on writeEnvelope error")
+	}
+
+	if !fwc.closed.Load() {
+		t.Fatal("expected conn.Close() to run immediately on writeEnvelope failure")
 	}
 }

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- In-memory streaming WebSocket relay server (`cmd/relay`) with bounded memory budgets, zero persistence, and automatic session idle timeout eviction ([#16](https://github.com/iinozemtsev-lab/dtfm/issues/16)).
+- Authenticated End-to-End Encryption (E2EE) cryptographic transport framing (`pkg/e2ee`) using AES-256-GCM with bilateral 32-byte CSPRNG handshake nonces, 64-bit monotonic counter nonces, zero-knowledge HKDF upgrade authorization, directional subkey derivation via HKDF-SHA256, and session ID binding in Additional Authenticated Data (AAD) ([#16](https://github.com/iinozemtsev-lab/dtfm/issues/16)).
+- Operator relay adapter (`dtfm --relay`) generating ephemeral session tokens and Agent Magic Links (`https://dtfm.dev/c/<session-id>#<key>`) with approval prompter bridging ([#16](https://github.com/iinozemtsev-lab/dtfm/issues/16)).
+- Agent relay adapter (`lmdtfy --relay <TOKEN_OR_URL>`) for transparent E2EE `ping` and `exec` execution across NATs and cloud environments without SSH keys ([#16](https://github.com/iinozemtsev-lab/dtfm/issues/16)).
+- End-to-end integration test suite simulating full relay WebSocket pairing, cryptographic verification, zero-knowledge payload assertions, and CLI lifecycle execution ([#16](https://github.com/iinozemtsev-lab/dtfm/issues/16)).
+
 ## [0.2.0] - 2026-11-11
 
 ### Added

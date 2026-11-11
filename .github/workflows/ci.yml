@@ -97,6 +97,10 @@ jobs:
             "bin/dist/lmdtfy-darwin-amd64"
             "bin/dist/lmdtfy-linux-amd64"
             "bin/dist/lmdtfy-linux-arm64"
+            "bin/dist/relay-darwin-arm64"
+            "bin/dist/relay-darwin-amd64"
+            "bin/dist/relay-linux-amd64"
+            "bin/dist/relay-linux-arm64"
           )
           for target in "${targets[@]}"; do
             if [ ! -f "$target" ]; then
@@ -113,6 +117,8 @@ jobs:
             "bin/dist/dtfm-linux-arm64"
             "bin/dist/lmdtfy-linux-amd64"
             "bin/dist/lmdtfy-linux-arm64"
+            "bin/dist/relay-linux-amd64"
+            "bin/dist/relay-linux-arm64"
           )
           for bin in "${linux_binaries[@]}"; do
             if ! command -v readelf >/dev/null 2>&1; then

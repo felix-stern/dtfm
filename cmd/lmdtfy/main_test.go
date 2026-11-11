@@ -72,8 +72,11 @@ func TestExecutePing(t *testing.T) {
 
 		var env protocol.Envelope
 		_ = json.NewDecoder(conn).Decode(&env)
+		var pingReq protocol.PingRequest
+		_ = json.Unmarshal(env.Data, &pingReq)
 
 		resp := protocol.PingResponse{
+			ID:        pingReq.ID,
 			Active:    true,
 			User:      "test-operator",
 			Hostname:  "test-box",
@@ -227,6 +230,14 @@ func TestExecuteEnvelopeValidation(t *testing.T) {
 			_ = json.NewDecoder(conn).Decode(&env)
 
 			outEnv := <-sendEnv
+			if outEnv.Type == protocol.TypePingResp {
+				var pingReq protocol.PingRequest
+				_ = json.Unmarshal(env.Data, &pingReq)
+				var pingResp protocol.PingResponse
+				_ = json.Unmarshal(outEnv.Data, &pingResp)
+				pingResp.ID = pingReq.ID
+				outEnv, _ = protocol.NewEnvelope(protocol.TypePingResp, pingResp)
+			}
 			_ = json.NewEncoder(conn).Encode(outEnv)
 			conn.Close()
 		}
@@ -369,5 +380,119 @@ func TestCLINoArgs(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "Usage:") {
 		t.Errorf("run([]) stderr = %q, expected usage banner", stderr.String())
+	}
+}
+
+func TestCLIRelayFlags(t *testing.T) {
+	// 1. Invalid relay token returns exit code 1
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"ping", "--relay", "invalidtokenwithoutkey"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("expected code 1 on invalid relay token, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "invalid relay token") {
+		t.Fatalf("expected invalid relay token error, got: %s", stderr.String())
+	}
+
+	// 2. Unreachable relay URL returns exit code 2 (session inactive)
+	stdout.Reset()
+	stderr.Reset()
+	code = run([]string{"ping", "--relay", "http://127.0.0.1:54321/c/nosession#0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("expected code 2 on unreachable relay, got %d (stderr: %s)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "LMDTFY session is inactive") {
+		t.Fatalf("expected inactive session message, got: %s", stderr.String())
+	}
+
+	// 3. Global --relay placed before subcommand is re-ordered cleanly
+	stdout.Reset()
+	stderr.Reset()
+	code = run([]string{"--relay", "invalidtoken", "ping"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("expected code 1 on invalid relay token with global flag, got %d", code)
+	}
+
+	// 4. LMDTFY_RELAY environment variable is used when flag is omitted
+	stdout.Reset()
+	stderr.Reset()
+	t.Setenv("LMDTFY_RELAY", "invalidtoken")
+	code = run([]string{"ping"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("expected code 1 on invalid LMDTFY_RELAY env var, got %d", code)
+	}
+}
+
+func TestExecPreservesTargetRelayArgs(t *testing.T) {
+	tmpDir := shortTempSockDir(t)
+	sockPath := filepath.Join(tmpDir, "target_args.sock")
+
+	var capturedReq protocol.CommandRequest
+	reqReceived := make(chan struct{})
+
+	l, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+	defer l.Close()
+
+	go func() {
+		conn, err := l.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		var env protocol.Envelope
+		decoder := json.NewDecoder(conn)
+		if err := decoder.Decode(&env); err != nil {
+			return
+		}
+		_ = json.Unmarshal(env.Data, &capturedReq)
+		close(reqReceived)
+
+		resp := protocol.CommandResponse{
+			ID:       capturedReq.ID,
+			Status:   protocol.StatusApproved,
+			ExitCode: 0,
+		}
+		respEnv, _ := protocol.NewEnvelope(protocol.TypeExecResp, resp)
+		encoder := json.NewEncoder(conn)
+		_ = encoder.Encode(respEnv)
+	}()
+
+	var stdout, stderr bytes.Buffer
+	args := []string{
+		"exec",
+		"--why", "test preserving args",
+		"--socket", sockPath,
+		"--",
+		"myapp",
+		"--relay", "prod",
+		"--relay=foo",
+	}
+
+	code := run(args, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("expected code 0, got %d (stderr: %s)", code, stderr.String())
+	}
+
+	select {
+	case <-reqReceived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for request")
+	}
+
+	if capturedReq.Command != "myapp" {
+		t.Errorf("expected command 'myapp', got %q", capturedReq.Command)
+	}
+	expectedArgs := []string{"--relay", "prod", "--relay=foo"}
+	if len(capturedReq.Args) != len(expectedArgs) {
+		t.Fatalf("expected %d args, got %d: %v", len(expectedArgs), len(capturedReq.Args), capturedReq.Args)
+	}
+	for i, a := range expectedArgs {
+		if capturedReq.Args[i] != a {
+			t.Errorf("arg %d mismatch: got %q, expected %q", i, capturedReq.Args[i], a)
+		}
 	}
 }

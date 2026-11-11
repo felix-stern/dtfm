@@ -67,7 +67,7 @@ make cross  # Cross-compile release binaries
 dtfm
 ```
 
-### 2. Connect Agent (Local or Remote)
+### 2. Connect Agent (Local, SSH, or E2EE Relay)
 - **Local Machine / Container**: `lmdtfy` connects automatically to the default socket path.
 - **Remote Server over SSH**: Forward the socket securely using `dtfm ssh-config`:
   ```bash
@@ -76,6 +76,15 @@ dtfm
   ssh dev-box
   ```
   *(Or ad-hoc forward: `ssh -R /run/user/<remote_uid>/lmdtfy.sock:<local_socket> dev-box`)*
+- **Cloud Sandboxes / NATs via E2EE Relay (No SSH keys required)**:
+  ```bash
+  # Operator starts relay listener (prints Agent Magic Link):
+  dtfm --relay
+
+  # Agent connects using the Magic Link URL or pairing token:
+  lmdtfy ping --relay "https://dtfm.dev/c/<session-id>#<key>"
+  lmdtfy exec --relay "https://dtfm.dev/c/<session-id>#<key>" --why "run migrations" make db-migrate
+  ```
 
 ### 3. Agent: Check Connectivity & Execute
 ```bash
@@ -94,10 +103,20 @@ lmdtfy exec --why "Run test suite" --cwd /opt/project --timeout 120 pytest
 ## CLI Reference
 
 - `dtfm [--socket <path>]`: Start approval server on default socket (or specified path).
+- `dtfm --relay [--relay-url <url>] [--hub-url <url>] [--session <id>]`: Start in-memory E2EE WebSocket relay session.
 - `dtfm ssh-config <host> [-w|--write] [--socket <path>] [--config <path>]`: Generate or atomically write `~/.ssh/config` `RemoteForward` block.
-- `lmdtfy ping [--socket <path>]`: Test operator listener connectivity.
-- `lmdtfy exec --why "<reason>" [--socket <path>] [--timeout <sec>] [--cwd <path>] <cmd>...`: Dispatch command for human review.
+- `lmdtfy ping [--socket <path>] [--relay <token-or-url>] [--relay-url <url>]`: Test operator listener connectivity.
+- `lmdtfy exec --why "<reason>" [--socket <path>] [--relay <token-or-url>] [--relay-url <url>] [--timeout <sec>] [--cwd <path>] <cmd>...`: Dispatch command for human review.
+- `relay [--listen <addr>] [--idle-timeout <dur>] [--max-sessions <n>] [--max-sessions-per-ip <n>] [--trusted-proxies <cidrs>]`: Standalone in-memory WebSocket streaming relay server (`cmd/relay`).
 - `dtfm --version` / `lmdtfy --version`: Display version information.
+
+### Environment Variables
+
+| Variable | Description |
+|---|---|
+| `LMDTFY_SOCKET` | Default socket path when `--socket` flag is omitted |
+| `LMDTFY_RELAY` | Default relay token or URL when `--relay` flag is omitted |
+| `LMDTFY_RELAY_URL` | Default relay endpoint URL when `--relay-url` flag is omitted |
 
 ---
 

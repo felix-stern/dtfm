@@ -9,12 +9,15 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/iinozemtsev-lab/dtfm/pkg/e2ee"
 	"github.com/iinozemtsev-lab/dtfm/pkg/protocol"
 )
 
@@ -32,15 +35,33 @@ func getVersion() string {
 	return "dev"
 }
 
+func isLoopbackHost(host string) bool {
+	h, _, err := net.SplitHostPort(host)
+	if err != nil {
+		h = host
+	}
+	h = strings.Trim(h, "[]")
+	if strings.EqualFold(h, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
+}
+
 func printMainUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  dtfm [options]                    Start dtfm operator server (default)")
+	fmt.Fprintln(w, "  dtfm --relay [options]            Start dtfm in public/private WebSocket relay mode")
 	fmt.Fprintln(w, "  dtfm ssh-config <host> [options]  Generate OpenSSH RemoteForward snippet")
 	fmt.Fprintln(w, "  dtfm version                      Display version and exit")
 	fmt.Fprintln(w, "  dtfm -h, --help                   Display help and exit")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Server options:")
 	fmt.Fprintln(w, "  --socket <path>   Path to listen Unix domain socket (default: /run/user/<uid>/lmdtfy.sock or ~/.lmdtfy.sock)")
+	fmt.Fprintln(w, "  --relay           Run in in-memory E2EE WebSocket relay mode")
+	fmt.Fprintln(w, "  --relay-url <url> WebSocket relay endpoint (default: wss://relay.dtfm.dev/ws)")
+	fmt.Fprintln(w, "  --hub-url <url>   Web hub base URL for Magic Links (default: https://dtfm.dev)")
+	fmt.Fprintln(w, "  --session <id>    Explicit session ID (default: randomly generated)")
 	fmt.Fprintln(w, "  -v, --version     Display version and exit")
 	fmt.Fprintln(w, "  -h, --help        Display help and exit")
 	fmt.Fprintln(w, "")
@@ -82,6 +103,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	fs.Usage = func() {}
 	sockPath := fs.String("socket", protocol.DefaultSocketPath(), "Path to listen Unix domain socket")
+	relayMode := fs.Bool("relay", false, "Start dtfm in public/private WebSocket relay mode")
+	relayURL := fs.String("relay-url", e2ee.DefaultRelayWsURL, "WebSocket relay endpoint")
+	hubURL := fs.String("hub-url", e2ee.DefaultHubURL, "Web hub base URL for Magic Links")
+	sessionID := fs.String("session", "", "Explicit session ID (default: randomly generated)")
 	showVersion := fs.Bool("version", false, "Display version and exit")
 	showVersionShort := fs.Bool("v", false, "Display version and exit")
 	showHelp := fs.Bool("help", false, "Display help and exit")
@@ -114,6 +139,99 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "dtfm: unknown command %q\n\n", fs.Arg(0))
 		printMainUsage(stderr)
 		return 1
+	}
+
+	if *relayMode {
+		sID := strings.TrimSpace(*sessionID)
+		if sID == "" {
+			var err error
+			sID, err = e2ee.GenerateSessionID()
+			if err != nil {
+				fmt.Fprintf(stderr, "Error generating session ID: %v\n", err)
+				return 1
+			}
+		} else {
+			if err := e2ee.ValidateSessionID(sID); err != nil {
+				fmt.Fprintf(stderr, "Error: invalid --session ID: %v\n", err)
+				return 1
+			}
+		}
+
+		// If relay-url was specified and hub-url was not explicitly set, derive hub-url
+		hubURLSet := false
+		relayURLSet := false
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "hub-url" {
+				hubURLSet = true
+			}
+			if f.Name == "relay-url" {
+				relayURLSet = true
+			}
+		})
+
+		effectiveHubURL := *hubURL
+		if relayURLSet && !hubURLSet {
+			u, err := url.Parse(*relayURL)
+			if err == nil {
+				scheme := "https"
+				if u.Scheme == "ws" {
+					scheme = "http"
+				}
+				basePath := strings.TrimSuffix(strings.TrimRight(u.Path, "/"), "/ws")
+				effectiveHubURL = fmt.Sprintf("%s://%s%s", scheme, u.Host, basePath)
+			}
+		}
+
+		u, err := url.Parse(*relayURL)
+		if err == nil && u.Scheme == "ws" && !isLoopbackHost(u.Hostname()) {
+			fmt.Fprintf(stderr, "[warning: connecting over unencrypted ws:// to non-loopback relay host %s]\n", u.Hostname())
+		}
+
+		secretKey, keyHex, err := e2ee.GenerateSessionKey()
+		if err != nil {
+			fmt.Fprintf(stderr, "Error generating session key: %v\n", err)
+			return 1
+		}
+
+		relayListener, err := DialRelayListener(*relayURL, sID, secretKey)
+		if err != nil {
+			fmt.Fprintf(stderr, "Error connecting to relay server: %v\n", err)
+			return 1
+		}
+		defer relayListener.Close()
+
+		prompter := NewTerminalPrompter()
+		defer prompter.Close()
+
+		server := NewServer(relayListener, prompter)
+
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+		defer signal.Stop(sigChan)
+		go func() {
+			<-sigChan
+			fmt.Fprintln(stdout, "\n🔴 Stopping dtfm relay session. Shutting down server and killing active child...")
+			server.Shutdown()
+		}()
+
+		magicLink := e2ee.FormatMagicLink(effectiveHubURL, sID, keyHex)
+		token := fmt.Sprintf("%s#%s", sID, keyHex)
+
+		hostname, _ := os.Hostname()
+		userName := protocol.CurrentUser()
+		fmt.Fprintf(stdout, "🟢 dtfm relay session started.\n")
+		fmt.Fprintf(stdout, "Relay: %s\n", *relayURL)
+		fmt.Fprintf(stdout, "Session ID: %s\n", sID)
+		fmt.Fprintf(stdout, "User: %s @ %s\n\n", userName, hostname)
+		fmt.Fprintf(stdout, "Agent Magic Link:\n  %s\n\n", magicLink)
+		fmt.Fprintf(stdout, "Pairing Token:\n  %s\n\n", token)
+		fmt.Fprintf(stdout, "Waiting for agent requests... (Press Ctrl+C to exit)\n\n")
+
+		if err := server.Serve(); err != nil && !errors.Is(err, net.ErrClosed) {
+			fmt.Fprintf(stderr, "dtfm relay server error: %v\n", err)
+			return 1
+		}
+		return 0
 	}
 
 	// Ensure and validate socket directory security (ownership, non-symlink, mode 0700 for shared runtime paths)

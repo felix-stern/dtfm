@@ -24,6 +24,7 @@ build:
 	mkdir -p $(BINARY_DIR)
 	$(GO_FLAGS) go build $(BUILD_FLAGS) -o $(BINARY_DIR)/dtfm ./cmd/dtfm
 	$(GO_FLAGS) go build $(BUILD_FLAGS) -o $(BINARY_DIR)/lmdtfy ./cmd/lmdtfy
+	$(GO_FLAGS) go build $(BUILD_FLAGS) -o $(BINARY_DIR)/relay ./cmd/relay
 
 vet:
 	go vet ./...
@@ -36,6 +37,7 @@ cross:
 		echo "Building for $${os}-$${arch}..."; \
 		GOOS=$${os} GOARCH=$${arch} $(GO_FLAGS) go build $(BUILD_FLAGS) -o $(BINARY_DIR)/dist/dtfm-$${os}-$${arch} ./cmd/dtfm || exit 1; \
 		GOOS=$${os} GOARCH=$${arch} $(GO_FLAGS) go build $(BUILD_FLAGS) -o $(BINARY_DIR)/dist/lmdtfy-$${os}-$${arch} ./cmd/lmdtfy || exit 1; \
+		GOOS=$${os} GOARCH=$${arch} $(GO_FLAGS) go build $(BUILD_FLAGS) -o $(BINARY_DIR)/dist/relay-$${os}-$${arch} ./cmd/relay || exit 1; \
 	done
 
 test:

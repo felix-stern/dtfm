@@ -31,6 +31,10 @@ const (
 	// MaxOutputBufferSize is the maximum stdout/stderr captured per stream (1 MB).
 	MaxOutputBufferSize = 1024 * 1024
 
+	// MaxResponseEnvelopeBytes is the upper bound on serialized response envelopes
+	// accounting for 6x JSON escaping expansion of binary/ANSI output (16 MB).
+	MaxResponseEnvelopeBytes = 16 * 1024 * 1024
+
 	// Standard process exit codes returned in CommandResponse
 	ExitCodeTimeout  = 124
 	ExitCodeRejected = 126
@@ -112,11 +116,13 @@ type CommandResponse struct {
 
 // PingRequest is sent to check if the user is connected and accepting requests.
 type PingRequest struct {
+	ID        string    `json:"id,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
 }
 
 // PingResponse is returned when the user session is active.
 type PingResponse struct {
+	ID        string    `json:"id,omitempty"`
 	Active    bool      `json:"active"`
 	User      string    `json:"user,omitempty"`
 	Hostname  string    `json:"hostname,omitempty"`
