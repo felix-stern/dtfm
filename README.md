@@ -43,8 +43,12 @@ sequenceDiagram
 Hermetic static binaries are available on [GitHub Releases](https://github.com/iinozemtsev-lab/dtfm/releases) for `darwin-arm64`, `darwin-amd64`, `linux-amd64`, and `linux-arm64`:
 ```bash
 curl -fLO https://github.com/iinozemtsev-lab/dtfm/releases/download/v0.2.0/dtfm_0.2.0_linux_amd64.tar.gz
-tar -xzf dtfm_0.2.0_linux_amd64.tar.gz && sudo install -m 0755 dtfm lmdtfy /usr/local/bin/
+mkdir -p ~/.local/bin
+tar -xzf dtfm_0.2.0_linux_amd64.tar.gz dtfm lmdtfy
+install -m 0755 dtfm lmdtfy ~/.local/bin/ && rm -f dtfm lmdtfy dtfm_0.2.0_linux_amd64.tar.gz
 ```
+
+*(Ensure `~/.local/bin` is in your `$PATH`.)*
 
 ### Build from Source (Go 1.22+)
 ```bash
