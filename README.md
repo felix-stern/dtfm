@@ -55,7 +55,21 @@ dtfm
 dtfm --socket /tmp/lmdtfy-1000/lmdtfy.sock
 ```
 
-### 2. Agent: Ping or Execute via `lmdtfy`
+### 2. Configure SSH Remote Forwarding (`dtfm ssh-config`)
+
+To streamline connecting from an operator laptop to a remote host (VM, container, or server) where an agent runs, use the built-in `ssh-config` helper:
+
+```bash
+# Inspect the required RemoteForward snippet for a target host:
+dtfm ssh-config dev-box
+
+# Atomically append or update ~/.ssh/config with strict 0600 permissions:
+dtfm ssh-config dev-box --write
+```
+
+Once configured, standard `ssh dev-box` automatically forwards the remote agent socket to your operator session!
+
+### 3. Agent: Ping or Execute via `lmdtfy`
 
 ```bash
 # Check if an operator session is active
@@ -72,21 +86,68 @@ lmdtfy exec --why "Run unit tests" --timeout 120 --cwd /opt/project go test ./..
 
 ## Remote Usage over SSH (`ssh -R`)
 
-To grant an agent running on a remote VM or container access to request local execution:
+When connecting from an operator workstation to a remote VM or container, `RemoteForward` tunnels requests from the remote agent back to the operator's `dtfm` approval listener.
+
+### Streamlined Onboarding (`dtfm ssh-config`)
+
+Different operating systems and hosts introduce path asymmetry:
+- On Linux, agents expect the socket at `$XDG_RUNTIME_DIR/lmdtfy.sock` (`/run/user/<remote_uid>/lmdtfy.sock`).
+- On macOS operator laptops, the default socket lives in `~/.lmdtfy.sock` (OpenSSH `%d` expands to the local client's home path, which does not match remote Linux paths).
+
+`dtfm ssh-config <host> [--write]` resolves this by querying the remote UID via `ssh <host> id -u` and generating the exact OpenSSH snippet:
 
 ```bash
-# Forward local Linux dtfm socket to remote host:
+# Preview configuration snippet:
+dtfm ssh-config user@remote-host
+
+# Output:
+# # Added by dtfm ssh-config
+# Host remote-host
+#     User user
+#     RemoteForward /run/user/1000/lmdtfy.sock /Users/ivan/.lmdtfy.sock
+#     StreamLocalBindUnlink yes
+
+# Atomically update ~/.ssh/config:
+dtfm ssh-config remote-host -w
+```
+
+### Manual Ad-hoc Forwarding
+
+If connecting without an `~/.ssh/config` entry, forward explicitly using `ssh -R`:
+
+```bash
+# Forward local Linux dtfm socket to remote Linux host:
 ssh -R /run/user/1000/lmdtfy.sock:/run/user/1000/lmdtfy.sock user@remote-host
 
-# Or forward local macOS dtfm socket (~/.lmdtfy.sock) to remote host:
+# Forward local macOS dtfm socket (~/.lmdtfy.sock) to remote Linux host:
 ssh -R /run/user/1000/lmdtfy.sock:/Users/alice/.lmdtfy.sock user@remote-host
 ```
 
-> **Note on sshd configuration**: Ensure `StreamLocalBindUnlink yes` is enabled in remote `/etc/ssh/sshd_config` so stale socket paths can be rebound on reconnect.
+### Zero-Install Shell Snippet
+
+For zero-install inspection without compiling `dtfm`:
+
+```bash
+REMOTE_UID=$(ssh user@remote-host id -u)
+[ -d "${XDG_RUNTIME_DIR:-}" ] && LOCAL_SOCK="$XDG_RUNTIME_DIR/lmdtfy.sock" || LOCAL_SOCK="$HOME/.lmdtfy.sock"
+printf "# Added by dtfm ssh-config\nHost remote-host\n    RemoteForward /run/user/%s/lmdtfy.sock %s\n    StreamLocalBindUnlink yes\n" "$REMOTE_UID" "$LOCAL_SOCK"
+```
+
+> **Note on environments**: `dtfm ssh-config` configures `/run/user/<remote_uid>/lmdtfy.sock` for remote Linux hosts with systemd (`XDG_RUNTIME_DIR`). For non-systemd containers or remote macOS hosts (where `/run/user/<uid>` is absent and `lmdtfy` falls back to `~/.lmdtfy.sock`), configure `RemoteForward /remote/home/.lmdtfy.sock <local_socket>` directly.
+
+> **Note on sshd configuration**: Ensure `StreamLocalBindUnlink yes` is enabled in remote `/etc/ssh/sshd_config` so stale socket paths are automatically rebound on reconnect.
 
 ---
 
 ## CLI Options
+
+### `dtfm ssh-config`
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-w`, `--write` | Atomically append or update host block in `~/.ssh/config` (`0600`) | `false` |
+| `--socket` | Local Unix domain socket path to forward | `protocol.DefaultSocketPath()` |
+| `--config` | Custom target SSH configuration file | `~/.ssh/config` |
 
 ### `lmdtfy exec`
 
