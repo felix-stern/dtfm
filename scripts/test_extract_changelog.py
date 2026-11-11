@@ -127,5 +127,23 @@ class TestExtractChangelog(unittest.TestCase):
             self.assertFalse(output_file.is_file())
 
 
+    def test_inline_reference_links_not_truncated(self):
+        changelog = (
+            "## [0.1.0] - 2026-11-10\n\n"
+            "### Added\n"
+            "- Protocol support per [RFC][rfc].\n\n"
+            "[rfc]: https://example.com/rfc\n\n"
+            "### Fixed\n"
+            "- Follow-up fix after inline reference link.\n\n"
+            "[0.1.0]: https://github.com/example/repo/releases/tag/v0.1.0\n"
+        )
+        self.path.write_text(changelog, encoding="utf-8")
+        notes = extract_changelog.extract_notes(self.path, "v0.1.0")
+        self.assertIn("[rfc]: https://example.com/rfc", notes)
+        self.assertIn("### Fixed", notes)
+        self.assertIn("- Follow-up fix after inline reference link.", notes)
+        self.assertNotIn("[0.1.0]: https://", notes)
+
+
 if __name__ == "__main__":
     unittest.main()

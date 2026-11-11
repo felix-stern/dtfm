@@ -43,6 +43,7 @@ cross:
 test:
 	go test -v -race $(TEST_LDFLAGS) ./...
 	python3 -W error scripts/test_extract_changelog.py
+	python3 -W error scripts/test_finalize_changelog.py
 
 clean:
 	rm -rf $(BINARY_DIR) dist artifacts RELEASE_NOTES.md

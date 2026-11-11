@@ -24,7 +24,9 @@ jobs:
     if: github.repository == 'iinozemtsev-lab/dtfm'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
+    outputs:
+      release_sha: ${{ steps.resolve-target.outputs.release_sha }}
     env:
       EVENT_NAME: ${{ github.event_name }}
       INPUT_VERSION: ${{ inputs.version }}
@@ -39,7 +41,7 @@ jobs:
           fi
 
           semver_regex='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
-          if [[ ! "$TAG" =~ $semver_regex ]]; then
+          if [[ "$TAG" == *$'\n'* || "$TAG" == *$'\r'* || ! "$TAG" =~ $semver_regex ]]; then
             echo "Error: Tag '$TAG' does not conform to strict SemVer (vMAJOR.MINOR.PATCH with no leading zeros)!" >&2
             exit 1
           fi
@@ -53,29 +55,70 @@ jobs:
           persist-credentials: false
 
       - name: Verify branch and commit ancestry on main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "Error: GH_TOKEN is required to fetch origin/main." >&2
+            exit 1
+          fi
+          basic_auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::${basic_auth}"
+
+          GIT_TERMINAL_PROMPT=0 git \
+            -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${basic_auth}" \
+            fetch --no-tags origin +main:refs/remotes/origin/main
+
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             if [ "$GITHUB_REF" != "refs/heads/main" ]; then
               echo "Error: Manual release dispatch must run against refs/heads/main, but got '$GITHUB_REF'!" >&2
               exit 1
             fi
             echo "✓ Confirmed workflow dispatched on refs/heads/main."
+
+            HEAD_SHA="$(git rev-parse HEAD)"
+            ORIGIN_MAIN_SHA="$(git rev-parse refs/remotes/origin/main)"
+            if [ "$HEAD_SHA" != "$ORIGIN_MAIN_SHA" ]; then
+              parent_sha="$(git rev-parse --verify refs/remotes/origin/main~1 2>/dev/null || true)"
+              second_parent="$(git rev-parse --verify refs/remotes/origin/main^2 2>/dev/null || true)"
+              tip_subject="$(git log -1 --format=%s refs/remotes/origin/main)"
+              tip_body="$(git log -1 --format=%b refs/remotes/origin/main)"
+              changed_files="$(git diff --name-only "$HEAD_SHA" refs/remotes/origin/main)"
+
+              if [ -z "$second_parent" ] \
+                && [ "$parent_sha" = "$HEAD_SHA" ] \
+                && [ "$tip_subject" = "chore(release): finalize changelog for ${TAG}" ] \
+                && [ -z "$tip_body" ] \
+                && [ "$changed_files" = "CHANGELOG.md" ]; then
+                echo "Detected prior release finalization commit $ORIGIN_MAIN_SHA on top of $HEAD_SHA (workflow re-run); detaching HEAD onto $ORIGIN_MAIN_SHA."
+                git checkout --detach refs/remotes/origin/main
+              else
+                echo "Error: origin/main advanced from $HEAD_SHA to $ORIGIN_MAIN_SHA since workflow_dispatch was queued!" >&2
+                echo "Please trigger a fresh workflow_dispatch run on the latest main branch." >&2
+                exit 1
+              fi
+            fi
+            echo "✓ Verified workflow_dispatch target commit $(git rev-parse HEAD) on main."
+          else
+            if ! git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
+              echo "Error: Commit $(git rev-parse HEAD) for release $TAG is not an ancestor of main!" >&2
+              exit 1
+            fi
+            echo "✓ Verified commit ancestry on main."
           fi
 
-          git fetch --no-tags origin main:refs/remotes/origin/main
-          if ! git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
-            echo "Error: Commit $GITHUB_SHA for release $TAG is not an ancestor of main!" >&2
-            exit 1
-          fi
-          echo "✓ Verified commit ancestry on main."
-
-      - name: Verify release and tag collision guards
+      - name: Verify pre-flight release and tag collision guards
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "Error: GH_TOKEN is required for release and tag collision checks." >&2
+            exit 1
+          fi
+
           # Fail closed if a published (non-draft) release already exists for this tag
           api_output="$(gh api -i "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" 2>&1 || true)"
-          http_status="$(printf '%s\n' "$api_output" | awk '/^HTTP\/[0-9.]* / {print $2; exit}')"
+          http_status="$(printf '%s\n' "$api_output" | awk '/^HTTP\/[0-9.]* / { status=$2; if (status !~ /^(1|3)/) exit } END { if (status != "") print status }')"
           if [ "$http_status" = "200" ]; then
             echo "Error: Published release '$TAG' already exists in $GITHUB_REPOSITORY!" >&2
             exit 1
@@ -88,20 +131,62 @@ jobs:
           fi
 
           # Verify remote tag-SHA on origin for both workflow_dispatch and push
-          existing_tag_sha="$(git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$TAG" "refs/tags/$TAG^{}" | awk -v r="refs/tags/$TAG" '$2 == r { sha=$1 } $2 == r "^{}" { peeled=$1 } END { print (peeled != "" ? peeled : sha) }')"
+          basic_auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::${basic_auth}"
+
+          ls_remote_out="$(GIT_TERMINAL_PROMPT=0 git \
+            -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${basic_auth}" \
+            ls-remote --tags "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" "refs/tags/$TAG" "refs/tags/$TAG^{}")"
+          existing_tag_sha="$(printf '%s\n' "$ls_remote_out" | awk -v r="refs/tags/$TAG" '$2 == r { sha=$1 } $2 == r "^{}" { peeled=$1 } END { print (peeled != "" ? peeled : sha) }')"
+          current_head="$(git rev-parse HEAD)"
 
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            if [ -n "$existing_tag_sha" ] && [ "$existing_tag_sha" != "$GITHUB_SHA" ]; then
-              echo "Error: Git tag 'refs/tags/$TAG' already exists on origin pointing to commit $existing_tag_sha, but current HEAD is $GITHUB_SHA!" >&2
+            if [ -n "$existing_tag_sha" ] && [ "$existing_tag_sha" != "$current_head" ]; then
+              echo "Error: Git tag 'refs/tags/$TAG' already exists on origin pointing to commit $existing_tag_sha, but current HEAD is $current_head!" >&2
               exit 1
             fi
           else
-            if [ -z "$existing_tag_sha" ] || [ "$existing_tag_sha" != "$GITHUB_SHA" ]; then
-              echo "Error: Git tag 'refs/tags/$TAG' on origin does not match current commit $GITHUB_SHA (found: '$existing_tag_sha')!" >&2
+            if [ -z "$existing_tag_sha" ] || [ "$existing_tag_sha" != "$current_head" ]; then
+              echo "Error: Git tag 'refs/tags/$TAG' on origin does not match current commit $current_head (found: '$existing_tag_sha')!" >&2
               exit 1
             fi
           fi
-          echo "✓ Release and tag collision checks passed."
+          echo "PREFLIGHT_TAG_SHA=$existing_tag_sha" >> "$GITHUB_ENV"
+          echo "✓ Pre-flight release and tag collision checks passed."
+
+      - name: Finalize CHANGELOG.md locally
+        if: env.EVENT_NAME == 'workflow_dispatch'
+        run: |
+          echo "Finalizing CHANGELOG.md for $TAG..."
+          python3 scripts/finalize-changelog.py "$TAG" CHANGELOG.md
+
+          if git diff --quiet CHANGELOG.md; then
+            echo "NEEDS_MAIN_PUSH=false" >> "$GITHUB_ENV"
+            echo "CHANGELOG.md already finalized; no new commit needed."
+          else
+            if [ -n "${PREFLIGHT_TAG_SHA:-}" ]; then
+              echo "Error: Git tag 'refs/tags/$TAG' already exists on origin at $PREFLIGHT_TAG_SHA; cannot create a new changelog finalization commit!" >&2
+              exit 1
+            fi
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add CHANGELOG.md
+            git commit -m "chore(release): finalize changelog for ${TAG}"
+            echo "NEEDS_MAIN_PUSH=true" >> "$GITHUB_ENV"
+            echo "✓ Committed finalized CHANGELOG.md locally (remote push deferred until all checks and builds pass)."
+          fi
+
+      - name: Resolve target release commit SHA
+        id: resolve-target
+        run: |
+          RELEASE_SHA="$(git rev-parse HEAD)"
+          if [[ ! "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Error: Resolved invalid RELEASE_SHA '$RELEASE_SHA'!" >&2
+            exit 1
+          fi
+          echo "release_sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_SHA=$RELEASE_SHA" >> "$GITHUB_ENV"
+          echo "✓ Target release commit SHA: $RELEASE_SHA"
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -120,7 +205,8 @@ jobs:
           fi
           go vet ./...
           go test -v -race ./...
-          python3 -W error scripts/test_extract_changelog.py
+          PYTHONDONTWRITEBYTECODE=1 python3 -W error scripts/test_extract_changelog.py
+          PYTHONDONTWRITEBYTECODE=1 python3 -W error scripts/test_finalize_changelog.py
           echo "✓ All pre-release quality gates passed."
 
       - name: Extract Release Notes from CHANGELOG.md
@@ -229,10 +315,47 @@ jobs:
       - name: Generate and verify cryptographic SHA256SUMS
         working-directory: artifacts
         run: |
+          rm -f SHA256SUMS
           sha256sum * > SHA256SUMS
           sha256sum -c SHA256SUMS
           echo "Generated cryptographic checksums:"
           cat SHA256SUMS
+
+      - name: Push finalized CHANGELOG.md to main
+        if: env.EVENT_NAME == 'workflow_dispatch' && env.NEEDS_MAIN_PUSH == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "Error: GH_TOKEN is required to push finalized CHANGELOG.md to main." >&2
+            exit 1
+          fi
+
+          # Re-verify no published release or remote tag appeared during verification and builds
+          api_output="$(gh api -i "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" 2>&1 || true)"
+          http_status="$(printf '%s\n' "$api_output" | awk '/^HTTP\/[0-9.]* / { status=$2; if (status !~ /^(1|3)/) exit } END { if (status != "") print status }')"
+          if [ "$http_status" != "404" ]; then
+            echo "Error: Expected HTTP 404 for release '$TAG' before pushing to main, but got HTTP ${http_status:-unknown}!" >&2
+            echo "$api_output" >&2
+            exit 1
+          fi
+
+          basic_auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::${basic_auth}"
+
+          ls_remote_out="$(GIT_TERMINAL_PROMPT=0 git \
+            -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${basic_auth}" \
+            ls-remote --tags "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" "refs/tags/$TAG" "refs/tags/$TAG^{}")"
+          existing_tag_sha="$(printf '%s\n' "$ls_remote_out" | awk -v r="refs/tags/$TAG" '$2 == r { sha=$1 } $2 == r "^{}" { peeled=$1 } END { print (peeled != "" ? peeled : sha) }')"
+          if [ -n "$existing_tag_sha" ]; then
+            echo "Error: Git tag 'refs/tags/$TAG' already exists on origin ($existing_tag_sha); aborting push to main!" >&2
+            exit 1
+          fi
+
+          GIT_TERMINAL_PROMPT=0 git \
+            -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${basic_auth}" \
+            push origin HEAD:refs/heads/main
+          echo "✓ Pushed finalized CHANGELOG.md commit $(git rev-parse HEAD) to origin/main."
 
       - name: Upload release assets
         uses: actions/upload-artifact@v6
@@ -254,6 +377,7 @@ jobs:
       EVENT_NAME: ${{ github.event_name }}
       INPUT_VERSION: ${{ inputs.version }}
       REF_NAME: ${{ github.ref_name }}
+      RELEASE_SHA: ${{ needs.verify-and-build.outputs.release_sha }}
     steps:
       - name: Download release assets
         uses: actions/download-artifact@v7
@@ -264,6 +388,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "Error: GH_TOKEN is required to publish GitHub Release." >&2
+            exit 1
+          fi
+
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             TAG="$INPUT_VERSION"
           else
@@ -271,13 +400,19 @@ jobs:
           fi
           export TAG
 
+          if [[ ! "${RELEASE_SHA:-}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Error: Missing or invalid 40-char RELEASE_SHA '${RELEASE_SHA:-}' from verify-and-build!" >&2
+            exit 1
+          fi
+          TARGET_SHA="$RELEASE_SHA"
+
           # 1. Re-verify cryptographic SHA256SUMS before publishing
           echo "Re-verifying cryptographic SHA256SUMS..."
           (cd artifacts && sha256sum -c SHA256SUMS)
 
           # 2. Re-verify fail-closed published release check and remote tag-SHA invariant
           api_output="$(gh api -i "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" 2>&1 || true)"
-          http_status="$(printf '%s\n' "$api_output" | awk '/^HTTP\/[0-9.]* / {print $2; exit}')"
+          http_status="$(printf '%s\n' "$api_output" | awk '/^HTTP\/[0-9.]* / { status=$2; if (status !~ /^(1|3)/) exit } END { if (status != "") print status }')"
           if [ "$http_status" = "200" ]; then
             echo "Error: Published release '$TAG' already exists in $GITHUB_REPOSITORY!" >&2
             exit 1
@@ -289,15 +424,21 @@ jobs:
             exit 1
           fi
 
-          existing_tag_sha="$(git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$TAG" "refs/tags/$TAG^{}" | awk -v r="refs/tags/$TAG" '$2 == r { sha=$1 } $2 == r "^{}" { peeled=$1 } END { print (peeled != "" ? peeled : sha) }')"
+          basic_auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::${basic_auth}"
+
+          ls_remote_out="$(GIT_TERMINAL_PROMPT=0 git \
+            -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${basic_auth}" \
+            ls-remote --tags "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" "refs/tags/$TAG" "refs/tags/$TAG^{}")"
+          existing_tag_sha="$(printf '%s\n' "$ls_remote_out" | awk -v r="refs/tags/$TAG" '$2 == r { sha=$1 } $2 == r "^{}" { peeled=$1 } END { print (peeled != "" ? peeled : sha) }')"
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            if [ -n "$existing_tag_sha" ] && [ "$existing_tag_sha" != "$GITHUB_SHA" ]; then
-              echo "Error: Git tag 'refs/tags/$TAG' already exists on origin pointing to commit $existing_tag_sha, but current HEAD is $GITHUB_SHA!" >&2
+            if [ -n "$existing_tag_sha" ] && [ "$existing_tag_sha" != "$TARGET_SHA" ]; then
+              echo "Error: Git tag 'refs/tags/$TAG' already exists on origin pointing to commit $existing_tag_sha, but current release target is $TARGET_SHA!" >&2
               exit 1
             fi
           else
-            if [ -z "$existing_tag_sha" ] || [ "$existing_tag_sha" != "$GITHUB_SHA" ]; then
-              echo "Error: Git tag 'refs/tags/$TAG' on origin does not match current commit $GITHUB_SHA (found: '$existing_tag_sha')!" >&2
+            if [ -z "$existing_tag_sha" ] || [ "$existing_tag_sha" != "$TARGET_SHA" ]; then
+              echo "Error: Git tag 'refs/tags/$TAG' on origin does not match current commit $TARGET_SHA (found: '$existing_tag_sha')!" >&2
               exit 1
             fi
           fi
@@ -324,7 +465,7 @@ jobs:
 
           target_flags=()
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            target_flags+=("--target" "$GITHUB_SHA")
+            target_flags+=("--target" "$TARGET_SHA")
           else
             target_flags+=("--verify-tag")
           fi

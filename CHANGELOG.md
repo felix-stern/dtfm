@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Automated changelog finalization on manual `workflow_dispatch` releases via `scripts/finalize-changelog.py`, automatically rotating `[Unreleased]` changes into `## [<VERSION>] - <YYYY-MM-DD>`, updating Keep a Changelog comparison links, committing `chore(release): finalize changelog for <TAG>` to `main` after pre-release quality gates and builds succeed, and bundling the finalized changelog into all distribution archives ([#18](https://github.com/iinozemtsev-lab/dtfm/issues/18)).
 - In-memory streaming WebSocket relay server (`cmd/relay`) with bounded memory budgets, zero persistence, and automatic session idle timeout eviction ([#16](https://github.com/iinozemtsev-lab/dtfm/issues/16)).
 - Authenticated End-to-End Encryption (E2EE) cryptographic transport framing (`pkg/e2ee`) using AES-256-GCM with bilateral 32-byte CSPRNG handshake nonces, 64-bit monotonic counter nonces, zero-knowledge HKDF upgrade authorization, directional subkey derivation via HKDF-SHA256, and session ID binding in Additional Authenticated Data (AAD) ([#16](https://github.com/iinozemtsev-lab/dtfm/issues/16)).
 - Operator relay adapter (`dtfm --relay`) generating ephemeral session tokens and Agent Magic Links (`https://dtfm.dev/c/<session-id>#<key>`) with approval prompter bridging ([#16](https://github.com/iinozemtsev-lab/dtfm/issues/16)).
