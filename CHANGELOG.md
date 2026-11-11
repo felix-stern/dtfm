@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CLI version flags (`--version`, `-v`, `-version`) and `version` subcommands across `dtfm` and `lmdtfy` binaries with linker version injection support via `-ldflags="-s -w -X 'main.version=${TAG}'"` and build info fallback ([#3](https://github.com/iinozemtsev-lab/dtfm/issues/3)).
 - One-shot OpenSSH configuration helper `dtfm ssh-config <host> [--write]` querying remote UID via `ssh <host> id -u` and generating or atomically updating `RemoteForward` host blocks in `~/.ssh/config` ([#2](https://github.com/iinozemtsev-lab/dtfm/issues/2), [#4](https://github.com/iinozemtsev-lab/dtfm/pull/4)).
 
+### Changed
+- Streamlined `README.md` into a concise ~120-line document with a theme-aware Mermaid sequence diagram, consolidated Quickstart flow, and extracted maintainer release procedures into `docs/releasing.md` ([#8](https://github.com/iinozemtsev-lab/dtfm/issues/8)).
+- Updated `LICENSE` with explicit copyright attribution (`Copyright 2026 Ivan Inozemtsev`) and added 2-line SPDX headers across all Go source files ([#8](https://github.com/iinozemtsev-lab/dtfm/issues/8)).
+
 ## [0.1.0] - 2026-11-10
 
 ### Added

@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Inozemtsev
+// SPDX-License-Identifier: Apache-2.0
+
 package protocol
 
 import (
