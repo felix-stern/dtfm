@@ -1,10 +1,18 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/dtfm-logo-dark.jpg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/dtfm-logo-light.jpg">
+    <img alt="dtfm logo" src="assets/dtfm-logo-light.jpg" width="180">
+  </picture>
+</p>
+
 # dtfm & lmdtfy
 
 **Teleport your agent. Instantly. Precisely.**  
-*Execute commands on your machine or servers from sandboxed AI agents — without sharing your credentials.*
+*Execute commands on your machine or servers from local or sandboxed AI agents — without sharing your credentials.*
 
 - `dtfm` (*Do That For Me*) runs on your workstation or target host, listening over a local Unix socket or end-to-end encrypted (E2EE) WebSocket relay and prompting you for approval before running any command.
-- `lmdtfy` (*Let Me Do That For You*) runs inside the agent's environment (SSH-reachable VM, local container, or cloud sandbox), dispatching commands to `dtfm` with an explicit reason (`--why`).
+- `lmdtfy` (*Let Me Do That For You*) runs inside the agent's environment (local workstation or container, SSH-reachable VM, or cloud sandbox), dispatching commands to `dtfm` with an explicit reason (`--why`).
 
 ---
 
@@ -12,9 +20,9 @@
 
 Autonomous AI coding agents work best when they can run tools, test commands, and inspect environments directly. However, giving an agent full shell access or copying master credentials into an agent container creates severe security and operational friction. `dtfm` bridges this boundary with human-in-the-loop verification across three concrete developer scenarios:
 
+- **Local privileged operations without passwordless `sudo`**: Local coding agents (such as `agy`, Claude Code, or Cursor) often need elevated privileges to install system packages, manage system services, or configure network interfaces. Granting passwordless `sudo` in `/etc/sudoers` or exposing host credentials to the agent process increases the attack surface of the local machine. With `dtfm`, the agent dispatches privileged commands via `lmdtfy exec --why ... sudo ...` over the local Unix domain socket. The operator reviews the request and enters their password directly on `/dev/tty`. The agent process never sees or handles the credentials.
 - **Keep secrets out of agent sandboxes**: Workstations hold master cloud credentials (`gcloud`, `aws`, `kubectl`, `1Password`, `gh`), while AI agents run in sandboxes (Docker, VMs, Codespaces). Copying credentials into the sandbox is dangerous; manual copy-pasting breaks agent flow. `dtfm` lets the agent run `lmdtfy exec --why ...`, executing on the host after explicit terminal approval (`[y]`) with zero leaked tokens.
 - **Supervised driving on remote servers**: Configure or debug a remote VPS (Nginx, systemd, firewall) with `dtfm` running in your SSH session — the agent does the heavy typing and diagnostics while you keep a foot on the brake via `[y] Run / [e] Edit / [n] Reject` rather than granting an LLM unchecked root or `sudo` access.
-- **Zero-trust remote pairing & assistance**: Assist a peer or family member on terminal tasks with per-command confirmation instead of clumsy screen-sharing or wide-open SSH.
 
 ---
 
@@ -64,9 +72,11 @@ ssh agent-vm
 </details>
 
 <details>
-<summary><b>Same Machine or Local Container</b> — shared local Unix socket</summary>
+<summary><b>Same Machine or Local Container (Local Coding Agents)</b> — shared local Unix socket</summary>
 
-`lmdtfy` connects automatically to the default local socket path (for containers, bind-mount the socket — e.g. to `/run/lmdtfy.sock` — and set `LMDTFY_SOCKET`; on Linux, match the host UID or run as root).
+For local coding agents (such as `agy`, Claude Code, or Cursor) running on the same machine, zero extra setup is needed — `lmdtfy` connects automatically to the default local socket path (`/run/user/<uid>/lmdtfy.sock` on Linux, `~/.lmdtfy.sock` on macOS).
+
+For container sandboxes, bind-mount a dedicated socket directory rather than a single file (e.g. start `dtfm --socket "$HOME/.dtfm/lmdtfy.sock"`, mount `-v "$HOME/.dtfm:/run/dtfm"`, and set `LMDTFY_SOCKET=/run/dtfm/lmdtfy.sock`, running the container with `--user "$(id -u):$(id -g)"` on Linux) so host `dtfm` restarts don't orphan the mounted socket inode.
 
 </details>
 
@@ -124,6 +134,8 @@ When your agent dispatches a command, `dtfm` prompts on your terminal before any
 Approve execution? [y] Run  [e] Edit  [n] Reject:
 ```
 
+When an approved command (`y` + `Enter`) invokes an authenticator like `sudo` or `ssh`, `dtfm` hands foreground `/dev/tty` control directly to it so you enter your password securely on your terminal without the agent process ever seeing it.
+
 ---
 
 ## Architecture
@@ -148,7 +160,9 @@ sequenceDiagram
 - **Interactive Approvals & Inline Editing**: Requests are displayed in lossless POSIX / ANSI-C (`$'...'`) shell syntax with visibly escaped terminal control codes and Trojan Source bidi characters. Operators can edit commands inline with Readline-style keybindings (`[e]`) before running, and pending TTY input is flushed prior to prompting so pre-typed keystrokes cannot auto-approve requests.
 - **Fail-Closed Security**: Dead stdin/EOF, backgrounded TTYs, TTY input-flush errors, and closed client connections immediately reject execution (exit code `126`). Any custom environment variables are rejected upfront (e.g., `LD_*`, `PATH`).
 - **Bounded Resources**: Request frames are capped at 4 MiB; captured `stdout` and `stderr` are bounded to 1 MiB per stream (16 MiB max serialized response envelope).
-- **Process Isolation**: Child and grandchild processes run in dedicated process groups and terminate on timeout or cancellation (`SIGKILL`).
+- **Controlling Terminal Handover (`TIOCSPGRP` / `Ctty`)**: When `dtfm` runs in the foreground on `/dev/tty`, approved child processes receive foreground terminal control (`TIOCSPGRP`). This lets authenticators like `sudo`, `ssh`, or `pinentry` prompt the operator directly on `/dev/tty` for passwords without triggering `SIGTTOU` or `SIGTTIN`, restoring original `termios` attributes (`TCSAFLUSH`) upon completion.
+- **Input Sandboxing (`stdin` to `/dev/null`)**: Standard input of the child process is bound to `/dev/null` while authenticators access `/dev/tty` directly. Non-authenticating commands receive an immediate `EOF` rather than capturing unprompted keystrokes from the operator's terminal, with `stdout` and `stderr` mirrored live to the display.
+- **Process Group Isolation**: Child and grandchild processes run in dedicated process groups and terminate on timeout or cancellation (`SIGKILL`).
 
 > [!IMPORTANT]
 > **Trust Model**: `dtfm` is a human-in-the-loop safety gate ("seatbelt") designed to prevent accidental misuse or unintended commands from AI agents in environments you control. Approved commands run **unsandboxed** with your local user privileges, and terminal sanitization is best-effort — **do not** expose or forward the `dtfm` socket (or share relay pairing links) with untrusted hosts or third parties, and always review commands before approving.
