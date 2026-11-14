@@ -17,17 +17,24 @@ func isTerminalFD(fd uintptr) bool {
 	return err == nil
 }
 
+// flushTTYInput flushes unread input from the terminal's kernel input queue on macOS.
+func flushTTYInput(fd uintptr) error {
+	// TIOCFLUSH on Darwin/BSD takes a pointer to an int with flags (1 = FREAD / TIOCPKT_FLUSHREAD).
+	return unix.IoctlSetPointerInt(int(fd), unix.TIOCFLUSH, 1)
+}
+
 // getTermios retrieves the current terminal settings on macOS.
 func getTermios(fd uintptr) (*termiosState, error) {
 	return unix.IoctlGetTermios(int(fd), unix.TIOCGETA)
 }
 
-// restoreTermios restores terminal settings and flushes pending input (TIOCSETAF) on macOS.
+// restoreTermios restores terminal settings on macOS.
 func restoreTermios(fd uintptr, t *termiosState) error {
 	if t == nil {
 		return nil
 	}
-	return unix.IoctlSetTermios(int(fd), unix.TIOCSETAF, t)
+	_ = flushTTYInput(fd)
+	return unix.IoctlSetTermios(int(fd), unix.TIOCSETA, t)
 }
 
 // setRawMode puts the terminal into raw mode for line editing on macOS, returning the previous state.

@@ -1147,9 +1147,27 @@ func (p *TerminalPrompter) DrainPendingInput() error {
 
 	if p.isTTY {
 		signal.Ignore(syscall.SIGTTOU, syscall.SIGTTIN)
-		orig, err := getTermios(p.file.Fd())
+		orig, err := setRawMode(p.file.Fd())
 		if err == nil {
-			err = restoreTermios(p.file.Fd(), orig)
+			var scratch [256]byte
+			for {
+				pfd := []unix.PollFd{{Fd: int32(p.file.Fd()), Events: unix.POLLIN}}
+				n, pollErr := unix.Poll(pfd, 0)
+				if pollErr != nil || n <= 0 || (pfd[0].Revents&unix.POLLIN) == 0 {
+					break
+				}
+				if p.reader.Buffered() > 0 {
+					_, _ = p.reader.Discard(p.reader.Buffered())
+				}
+				r, readErr := p.reader.Read(scratch[:])
+				if r <= 0 || readErr != nil {
+					break
+				}
+			}
+			if p.reader.Buffered() > 0 {
+				_, _ = p.reader.Discard(p.reader.Buffered())
+			}
+			_ = restoreTermios(p.file.Fd(), orig)
 		}
 		signal.Reset(syscall.SIGTTOU, syscall.SIGTTIN)
 		if err != nil {
