@@ -675,6 +675,27 @@ func (s *Server) processExec(conn net.Conn, br *bufio.Reader, req protocol.Comma
 	var resp protocol.CommandResponse
 	switch decision {
 	case DecisionApprove:
+		var password []byte
+		if commandNeedsSudo(req.Command, req.Args, "") {
+			if pp, ok := s.prompter.(PasswordPrompter); ok {
+				pw, pwErr := pp.PromptPassword(queueCtx)
+				if pwErr != nil {
+					if s.isShuttingDown(parentCtx, queueCtx) || errors.Is(pwErr, ErrServerShutdown) {
+						return rejectResp(req.ID, "Server is shutting down", start), false
+					}
+					if isClientDisconnected(parentCtx, queueCtx, disconnectCh) || errors.Is(pwErr, ErrClientDisconnected) {
+						return rejectResp(req.ID, "Client disconnected before operator approval", start), true
+					}
+					if queueCtx.Err() != nil || errors.Is(pwErr, context.DeadlineExceeded) {
+						return timeoutResp(req.ID, "Timed out waiting for operator password", start), false
+					}
+					return rejectResp(req.ID, "Password entry failed or cancelled", start), false
+				}
+				password = pw
+				defer memclr(password)
+			}
+		}
+
 		// Dedicated execution context budget: operator deliberation does not truncate command runtime.
 		// Derived from parentCtx so client disconnect or server shutdown cancels command execution immediately.
 		execCtx, execCancel := context.WithTimeout(parentCtx, totalTimeout)
@@ -685,6 +706,7 @@ func (s *Server) processExec(conn net.Conn, br *bufio.Reader, req protocol.Comma
 			Args:            req.Args,
 			Cwd:             req.Cwd,
 			ModifiedCommand: "",
+			Password:        password,
 			StartTime:       start,
 		})
 
@@ -693,19 +715,48 @@ func (s *Server) processExec(conn net.Conn, br *bufio.Reader, req protocol.Comma
 		if edited == "" {
 			return rejectResp(req.ID, "Edited command cannot be empty", start), false
 		}
+		var password []byte
+		unchanged := edited == protocol.FormatCommand(req.Command, req.Args)
+		needsSudo := false
+		if unchanged {
+			needsSudo = commandNeedsSudo(req.Command, req.Args, "")
+		} else {
+			needsSudo = commandNeedsSudo("", nil, edited)
+		}
+		if needsSudo {
+			if pp, ok := s.prompter.(PasswordPrompter); ok {
+				pw, pwErr := pp.PromptPassword(queueCtx)
+				if pwErr != nil {
+					if s.isShuttingDown(parentCtx, queueCtx) || errors.Is(pwErr, ErrServerShutdown) {
+						return rejectResp(req.ID, "Server is shutting down", start), false
+					}
+					if isClientDisconnected(parentCtx, queueCtx, disconnectCh) || errors.Is(pwErr, ErrClientDisconnected) {
+						return rejectResp(req.ID, "Client disconnected before operator approval", start), true
+					}
+					if queueCtx.Err() != nil || errors.Is(pwErr, context.DeadlineExceeded) {
+						return timeoutResp(req.ID, "Timed out waiting for operator password", start), false
+					}
+					return rejectResp(req.ID, "Password entry failed or cancelled", start), false
+				}
+				password = pw
+				defer memclr(password)
+			}
+		}
+
 		execCtx, execCancel := context.WithTimeout(parentCtx, totalTimeout)
 		defer execCancel()
-		if edited == protocol.FormatCommand(req.Command, req.Args) {
+		if unchanged {
 			resp = s.executor.Execute(execCtx, ExecOptions{
 				ID:              req.ID,
 				Command:         req.Command,
 				Args:            req.Args,
 				Cwd:             req.Cwd,
 				ModifiedCommand: "",
+				Password:        password,
 				StartTime:       start,
 			})
 		} else {
-			resp = s.executor.ExecuteShell(execCtx, req.ID, edited, req.Cwd, start)
+			resp = s.executor.ExecuteShell(execCtx, req.ID, edited, req.Cwd, start, password)
 		}
 
 	default:

@@ -134,7 +134,7 @@ When your agent dispatches a command, `dtfm` prompts on your terminal before any
 Approve execution? [y] Run  [e] Edit  [n] Reject:
 ```
 
-When an approved command (`y` + `Enter`) invokes an authenticator like `sudo` or `ssh`, `dtfm` hands foreground `/dev/tty` control directly to it so you enter your password securely on your terminal without the agent process ever seeing it.
+When an approved command (`y` + `Enter`) requires `sudo` elevation, `dtfm` prompts for your password locally without echo (`term.ReadPassword()`), pipes it directly to `sudo -S` over `stdin`, and immediately scrubs the password buffer in memory (`memclr`) so the agent process never sees it.
 
 ---
 
@@ -160,8 +160,8 @@ sequenceDiagram
 - **Interactive Approvals & Inline Editing**: Requests are displayed in lossless POSIX / ANSI-C (`$'...'`) shell syntax with visibly escaped terminal control codes and Trojan Source bidi characters. Operators can edit commands inline with Readline-style keybindings (`[e]`) before running, and pending TTY input is flushed prior to prompting so pre-typed keystrokes cannot auto-approve requests.
 - **Fail-Closed Security**: Dead stdin/EOF, backgrounded TTYs, TTY input-flush errors, and closed client connections immediately reject execution (exit code `126`). Any custom environment variables are rejected upfront (e.g., `LD_*`, `PATH`).
 - **Bounded Resources**: Request frames are capped at 4 MiB; captured `stdout` and `stderr` are bounded to 1 MiB per stream (16 MiB max serialized response envelope).
-- **Controlling Terminal Handover (`TIOCSPGRP` / `Ctty`)**: When `dtfm` runs in the foreground on `/dev/tty`, approved child processes receive foreground terminal control (`TIOCSPGRP`). This lets authenticators like `sudo`, `ssh`, or `pinentry` prompt the operator directly on `/dev/tty` for passwords without triggering `SIGTTOU` or `SIGTTIN`, restoring original `termios` attributes (`TCSAFLUSH`) upon completion.
-- **Input Sandboxing (`stdin` to `/dev/null`)**: Standard input of the child process is bound to `/dev/null` while authenticators access `/dev/tty` directly. Non-authenticating commands receive an immediate `EOF` rather than capturing unprompted keystrokes from the operator's terminal, with `stdout` and `stderr` mirrored live to the display.
+- **Dedicated Sudo Password Piping (`term.ReadPassword` / `sudo -S`)**: When an approved or edited command invokes `sudo`, `dtfm` retains exclusive ownership of `/dev/tty`, collects the operator's password without terminal echo (`term.ReadPassword`), pipes it directly into `sudo -S -p ""` via `stdin`, and immediately zeroes the password buffer in memory (`memclr`).
+- **Input Sandboxing (`stdin` to `/dev/null`)**: Standard input of non-`sudo` child processes is bound to `/dev/null`, so commands receive an immediate `EOF` rather than capturing unprompted keystrokes from the operator's terminal, with `stdout` and `stderr` mirrored live to the display.
 - **Process Group Isolation**: Child and grandchild processes run in dedicated process groups and terminate on timeout or cancellation (`SIGKILL`).
 
 > [!IMPORTANT]

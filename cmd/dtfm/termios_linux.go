@@ -17,11 +17,6 @@ func isTerminalFD(fd uintptr) bool {
 	return err == nil
 }
 
-// flushTTYInput flushes unread input from the terminal's kernel input queue.
-func flushTTYInput(fd uintptr) error {
-	return unix.IoctlSetInt(int(fd), unix.TCFLSH, unix.TCIFLUSH)
-}
-
 // getTermios retrieves the current terminal settings.
 func getTermios(fd uintptr) (*termiosState, error) {
 	return unix.IoctlGetTermios(int(fd), unix.TCGETS)
@@ -33,16 +28,6 @@ func restoreTermios(fd uintptr, t *termiosState) error {
 		return nil
 	}
 	return unix.IoctlSetTermios(int(fd), unix.TCSETSF, t)
-}
-
-// disableSusp disables the terminal VSUSP control character (Ctrl+Z) while a child process runs.
-func disableSusp(fd uintptr, t *termiosState) {
-	if t == nil {
-		return
-	}
-	cp := *t
-	cp.Cc[unix.VSUSP] = 0
-	_ = unix.IoctlSetTermios(int(fd), unix.TCSETSF, &cp)
 }
 
 // setRawMode puts the terminal into raw mode for line editing, returning the previous state.
@@ -59,6 +44,20 @@ func setRawMode(fd uintptr) (*termiosState, error) {
 	raw.Cc[unix.VMIN] = 1
 	raw.Cc[unix.VTIME] = 0
 	if err := unix.IoctlSetTermios(int(fd), unix.TCSETS, &raw); err != nil {
+		return nil, err
+	}
+	return orig, nil
+}
+
+// disableEcho disables terminal input echoing (ECHO/ECHONL), returning the previous state.
+func disableEcho(fd uintptr) (*termiosState, error) {
+	orig, err := getTermios(fd)
+	if err != nil {
+		return nil, err
+	}
+	noEcho := *orig
+	noEcho.Lflag &^= unix.ECHO | unix.ECHONL
+	if err := unix.IoctlSetTermios(int(fd), unix.TCSETS, &noEcho); err != nil {
 		return nil, err
 	}
 	return orig, nil

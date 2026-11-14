@@ -19,10 +19,6 @@ func isTerminalFD(fd uintptr) bool {
 	return err == nil
 }
 
-func flushTTYInput(fd uintptr) error {
-	return errors.New("TTY input flush not supported on this platform")
-}
-
 func getTermios(fd uintptr) (*termiosState, error) {
 	return nil, errors.New("termios not supported on this platform")
 }
@@ -31,8 +27,10 @@ func restoreTermios(fd uintptr, t *termiosState) error {
 	return nil
 }
 
-func disableSusp(fd uintptr, t *termiosState) {}
-
 func setRawMode(fd uintptr) (*termiosState, error) {
 	return nil, errors.New("raw mode not supported on this platform")
+}
+
+func disableEcho(fd uintptr) (*termiosState, error) {
+	return nil, errors.New("termios not supported on this platform")
 }

@@ -22,6 +22,7 @@ import (
 
 	"github.com/iinozemtsev-lab/dtfm/pkg/protocol"
 	"golang.org/x/sys/unix"
+	"golang.org/x/term"
 )
 
 type ApprovalDecision string
@@ -53,40 +54,49 @@ type Prompter interface {
 	Close() error
 }
 
+// PasswordPrompter is an optional interface implemented by prompters that can collect
+// an operator password (e.g. via term.ReadPassword) when sudo elevation is required.
+type PasswordPrompter interface {
+	PromptPassword(ctx context.Context) ([]byte, error)
+}
+
 type lineResult struct {
 	line      string
 	err       error
 	timestamp time.Time
 }
 
+type streamByte struct {
+	b   byte
+	err error
+	at  time.Time
+}
+
 type editRequest struct {
 	initial string
-	resp    chan lineResult
 	ctx     context.Context
 }
 
 // TerminalPrompter handles user interaction via a terminal or stream.
-// It uses a demand-gated reader goroutine so reading occurs ONLY when Prompt()
-// requests input. This guarantees zero concurrent reads on /dev/tty while
-// approved commands (like sudo or ssh) run in CommandExecutor.Execute.
 type TerminalPrompter struct {
 	reader          *bufio.Reader
 	writer          io.Writer
 	file            *os.File // underlying file descriptor (if any)
 	isTTY           bool     // true only if file is an actual character terminal device
-	linesChan       chan lineResult
-	wantLine        chan struct{}    // demand-gate: signals readLoop to read exactly one line
-	wantEdit        chan editRequest // demand-gate: signals readLoop to run interactive edit
 	done            chan struct{}
-	loopDone        chan struct{} // closed when readLoop terminates
 	closeOnce       sync.Once
 	closeErr        error
+	activeWG        sync.WaitGroup
 	mu              sync.Mutex
-	reading         bool      // true if readLoop is currently blocked in ReadString
-	streamErr       error     // permanently tracks stream closure / EOF
-	promptStartTime time.Time // timestamp when active prompt was presented
-	lastAbortTime   time.Time // timestamp when previous prompt ended via timeout/disconnect
+	streamErr       error           // permanently tracks stream closure / EOF
+	streamReadCh    chan streamByte // in-flight ReadByte when file == nil
+	promptStartTime time.Time       // timestamp when active prompt was presented
+	lastAbortTime   time.Time       // timestamp when previous prompt ended via timeout/disconnect
 	editOrigTermios *termiosState
+	partialLine     []byte
+	partialTime     time.Time
+	partialOverflow bool
+	readPasswordFn  func(fd int) ([]byte, error) // optional override for term.ReadPassword
 }
 
 func (p *TerminalPrompter) useColor() bool {
@@ -152,165 +162,46 @@ func newPrompter(r io.Reader, w io.Writer, f *os.File) *TerminalPrompter {
 	}
 
 	p := &TerminalPrompter{
-		reader:    bufio.NewReader(r),
-		writer:    &syncWriter{mu: &sync.Mutex{}, w: w},
-		file:      f,
-		isTTY:     isTTY,
-		linesChan: make(chan lineResult, 32),
-		wantLine:  make(chan struct{}, 1),
-		wantEdit:  make(chan editRequest, 1),
-		done:      make(chan struct{}),
-		loopDone:  make(chan struct{}),
+		reader:         bufio.NewReader(r),
+		writer:         &syncWriter{mu: &sync.Mutex{}, w: w},
+		file:           f,
+		isTTY:          isTTY,
+		done:           make(chan struct{}),
+		readPasswordFn: term.ReadPassword,
 	}
-
-	// Single dedicated demand-gated reader goroutine
-	go p.readLoop()
 
 	return p
 }
 
-func (p *TerminalPrompter) readLoop() {
-	defer close(p.loopDone)
-	var lineBuf []byte
-	var lineStartTime time.Time
-	overflow := false
-
-	for {
-		// Wait until Prompt() explicitly requests a line
-		select {
-		case <-p.wantLine:
-		case req := <-p.wantEdit:
-			res := p.runInteractiveEdit(req)
-			p.mu.Lock()
-			p.reading = false
-			p.mu.Unlock()
-			req.resp <- res
-			continue
-		case <-p.done:
-			return
-		}
-
-		for {
-			select {
-			case <-p.done:
-				return
-			default:
-			}
-
-			// When reading from an OS terminal / file, poll with 50ms timeout so Close()
-			// or stream closure can interrupt within 50ms without blocking forever
-			if p.file != nil && !p.hasPendingInput(50) {
-				continue
-			}
-
-			b, err := p.reader.ReadByte()
-			now := time.Now()
-
-			if err != nil {
-				p.mu.Lock()
-				p.reading = false
-				p.mu.Unlock()
-
-				if p.isTTY && errors.Is(err, io.EOF) {
-					// On a terminal, Ctrl+D delivers EOF without closing /dev/tty.
-					// Discard partial line, send EOF to cancel active prompt, but keep readLoop alive.
-					lineBuf = lineBuf[:0]
-					overflow = false
-					select {
-					case p.linesChan <- lineResult{err: io.EOF, timestamp: now}:
-					case <-p.done:
-						return
-					}
-					break
-				}
-
-				p.mu.Lock()
-				p.streamErr = err
-				p.mu.Unlock()
-
-				select {
-				case p.linesChan <- lineResult{line: string(lineBuf), err: err, timestamp: now}:
-				case <-p.done:
-				}
-				return
-			}
-
-			p.mu.Lock()
-			promptStart := p.promptStartTime
-			p.mu.Unlock()
-
-			if len(lineBuf) > 0 && !promptStart.IsZero() && lineStartTime.Before(promptStart) {
-				// Partial keystrokes from an earlier cancelled/timed-out prompt must be discarded
-				lineBuf = lineBuf[:0]
-				overflow = false
-				lineStartTime = now
-			}
-
-			if len(lineBuf) == 0 {
-				lineStartTime = now
-			}
-
-			if b == '\n' {
-				p.mu.Lock()
-				p.reading = false
-				p.mu.Unlock()
-
-				var res lineResult
-				if overflow {
-					res = lineResult{err: errors.New("input line exceeds maximum length"), timestamp: lineStartTime}
-					overflow = false
-				} else {
-					res = lineResult{line: string(lineBuf) + "\n", timestamp: lineStartTime}
-				}
-				lineBuf = lineBuf[:0]
-
-				select {
-				case p.linesChan <- res:
-				case <-p.done:
-					return
-				}
-				break
-			}
-
-			if len(lineBuf) < maxLineBuf {
-				lineBuf = append(lineBuf, b)
-			} else {
-				overflow = true
-			}
-		}
-	}
-}
-
-// requestLine signals readLoop to read exactly one line if not already reading.
-func (p *TerminalPrompter) requestLine() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.reading || p.streamErr != nil {
-		return
-	}
-
-	select {
-	case p.wantLine <- struct{}{}:
-		p.reading = true
-	default:
-	}
-}
-
-// Close terminates the background reader goroutine and closes /dev/tty if opened.
+// Close closes the prompter and /dev/tty if opened.
 func (p *TerminalPrompter) Close() error {
 	p.closeOnce.Do(func() {
+		p.mu.Lock()
 		close(p.done)
-		select {
-		case <-p.loopDone:
-		case <-time.After(300 * time.Millisecond):
-		}
+		p.mu.Unlock()
+		p.activeWG.Wait()
 		p.restoreEditMode()
 		if p.file != nil && p.file != os.Stdin {
 			p.closeErr = p.file.Close()
 		}
 	})
 	return p.closeErr
+}
+
+func (p *TerminalPrompter) enterOp() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	select {
+	case <-p.done:
+		return false
+	default:
+		p.activeWG.Add(1)
+		return true
+	}
+}
+
+func (p *TerminalPrompter) leaveOp() {
+	p.activeWG.Done()
 }
 
 func (p *TerminalPrompter) hasPendingInput(timeoutMs int) bool {
@@ -1126,164 +1017,288 @@ func (p *TerminalPrompter) promptEdit(ctx context.Context, initial string) (stri
 	}
 	p.mu.Unlock()
 
-	resp := make(chan lineResult, 1)
-	req := editRequest{
+	res := p.runInteractiveEdit(editRequest{
 		initial: initial,
-		resp:    resp,
 		ctx:     ctx,
+	})
+	if res.err != nil {
+		if ctx.Err() != nil {
+			fmt.Fprint(p.writer, "\r\n")
+		}
+		return "", res.err
 	}
+	return res.line, nil
+}
+
+// PromptPassword prompts the operator for their sudo password without terminal echo.
+func (p *TerminalPrompter) PromptPassword(ctx context.Context) ([]byte, error) {
+	if !p.enterOp() {
+		return nil, errPrompterClosed
+	}
+	defer p.leaveOp()
 
 	p.mu.Lock()
-	p.reading = true
+	if p.streamErr != nil {
+		err := p.streamErr
+		p.mu.Unlock()
+		return nil, err
+	}
 	p.mu.Unlock()
 
-	select {
-	case p.wantEdit <- req:
-	case <-ctx.Done():
-		p.mu.Lock()
-		p.reading = false
-		p.mu.Unlock()
-		return "", ctx.Err()
-	case <-p.done:
-		p.mu.Lock()
-		p.reading = false
-		p.mu.Unlock()
-		return "", errPrompterClosed
-	case <-p.loopDone:
-		p.mu.Lock()
-		p.reading = false
-		p.mu.Unlock()
-		return "", errPrompterClosed
-	}
-
-	select {
-	case res := <-resp:
-		if res.err != nil {
-			return "", res.err
-		}
-		return res.line, nil
-
-	case <-ctx.Done():
-		select {
-		case <-resp:
-		case <-p.loopDone:
-		}
-		fmt.Fprint(p.writer, "\r\n")
-		return "", ctx.Err()
-
-	case <-p.done:
-		select {
-		case <-resp:
-		case <-p.loopDone:
-		}
-		return "", errPrompterClosed
-
-	case <-p.loopDone:
-		return "", errPrompterClosed
-	}
-}
-
-func (p *TerminalPrompter) drainLinesChan() {
-	for {
-		select {
-		case res := <-p.linesChan:
-			if res.err != nil && !(p.isTTY && errors.Is(res.err, io.EOF)) {
-				p.mu.Lock()
-				p.streamErr = res.err
-				p.mu.Unlock()
-			}
-		default:
-			return
-		}
-	}
-}
-
-// DrainPendingInput clears any queued keystrokes from the lines channel, the user-space
-// bufio.Reader buffer, and the OS kernel input queue.
-func (p *TerminalPrompter) DrainPendingInput() error {
-	// 1. Drain pending lines already in the Go channel, preserving any terminal error
-	p.drainLinesChan()
-
-	// 2. Unconditionally flush OS kernel terminal buffer whenever isTTY && file != nil.
-	// (flushTTYInput is a driver ioctl that safely flushes the kernel queue even while read() is in flight)
 	if p.isTTY && p.file != nil {
 		signal.Ignore(syscall.SIGTTOU, syscall.SIGTTIN)
-		err := flushTTYInput(p.file.Fd())
+		orig, _ := disableEcho(p.file.Fd())
 		signal.Reset(syscall.SIGTTOU, syscall.SIGTTIN)
-		if err != nil {
-			return fmt.Errorf("failed to flush terminal input queue: %w", err)
+		if orig != nil {
+			defer func() {
+				signal.Ignore(syscall.SIGTTOU, syscall.SIGTTIN)
+				_ = restoreTermios(p.file.Fd(), orig)
+				signal.Reset(syscall.SIGTTOU, syscall.SIGTTIN)
+			}()
+		}
+
+		fmt.Fprintf(p.writer, "🔑 [sudo] Password: ")
+		for {
+			select {
+			case <-ctx.Done():
+				fmt.Fprintln(p.writer)
+				return nil, ctx.Err()
+			case <-p.done:
+				fmt.Fprintln(p.writer)
+				return nil, errPrompterClosed
+			default:
+			}
+			if !p.hasPendingInput(50) {
+				continue
+			}
+			readFn := p.readPasswordFn
+			if readFn == nil {
+				readFn = term.ReadPassword
+			}
+			pw, err := readFn(int(p.file.Fd()))
+			fmt.Fprintln(p.writer)
+			if err != nil {
+				if len(pw) > 0 {
+					memclr(pw)
+				}
+				return nil, err
+			}
+			return pw, nil
 		}
 	}
 
-	// 3. Re-drain channel once after flushing kernel queue
-	p.drainLinesChan()
+	fmt.Fprintf(p.writer, "🔑 [sudo] Password: ")
 
+	line, err := p.readLineWithContext(ctx)
+	fmt.Fprintln(p.writer)
+	if err != nil {
+		return nil, err
+	}
+	trimmed := strings.TrimRight(line, "\r\n")
+	return []byte(trimmed), nil
+}
+
+// DrainPendingInput clears any buffered keystrokes from the user-space bufio.Reader
+// and drains any pending non-blocking bytes from the terminal file descriptor.
+func (p *TerminalPrompter) DrainPendingInput() error {
 	p.mu.Lock()
-	if !p.reading && p.reader.Buffered() > 0 {
+	p.partialLine = p.partialLine[:0]
+	p.partialTime = time.Time{}
+	p.partialOverflow = false
+	p.mu.Unlock()
+
+	if p.file == nil {
+		for p.streamReadCh != nil {
+			select {
+			case res := <-p.streamReadCh:
+				p.streamReadCh = nil
+				if res.err != nil {
+					p.mu.Lock()
+					p.streamErr = res.err
+					p.mu.Unlock()
+					return nil
+				}
+				if p.reader.Buffered() > 0 {
+					_, _ = p.reader.Discard(p.reader.Buffered())
+				}
+			default:
+				// In-flight ReadByte is still waiting on the underlying io.Reader,
+				// so bufio.Reader is empty and owned by that goroutine.
+				return nil
+			}
+		}
+		if p.reader.Buffered() > 0 {
+			_, _ = p.reader.Discard(p.reader.Buffered())
+		}
+		return nil
+	}
+
+	if p.reader.Buffered() > 0 {
 		_, _ = p.reader.Discard(p.reader.Buffered())
 	}
-	p.mu.Unlock()
+
+	if p.isTTY {
+		var scratch [256]byte
+		for p.hasPendingInput(0) {
+			if p.reader.Buffered() > 0 {
+				_, _ = p.reader.Discard(p.reader.Buffered())
+				continue
+			}
+			n, err := p.reader.Read(scratch[:])
+			if n <= 0 || err != nil {
+				break
+			}
+		}
+	}
 
 	return nil
 }
 
 // readLineWithContext waits for a line of input or context cancellation.
-// It discards any line entered before the current prompt was displayed.
+// It discards any partial input entered before the current prompt was displayed.
 func (p *TerminalPrompter) readLineWithContext(ctx context.Context) (string, error) {
-	for {
-		// First check if there is an already queued line in linesChan
-		select {
-		case res := <-p.linesChan:
-			if res.err != nil {
-				return "", res.err
-			}
-			p.mu.Lock()
-			start := p.promptStartTime
-			p.mu.Unlock()
-			if !start.IsZero() && res.timestamp.Before(start) {
-				// Discard stale keystroke entered before prompt was presented
-				continue
-			}
-			return res.line, nil
-		case <-p.done:
-			return "", errPrompterClosed
-		case <-p.loopDone:
-			return "", errPrompterClosed
-		default:
-		}
-
-		p.mu.Lock()
+	p.mu.Lock()
+	if p.streamErr != nil {
 		err := p.streamErr
 		p.mu.Unlock()
-		if err != nil {
-			return "", err
-		}
+		return "", err
+	}
+	promptStart := p.promptStartTime
+	if len(p.partialLine) > 0 && !promptStart.IsZero() && p.partialTime.Before(promptStart) {
+		p.partialLine = p.partialLine[:0]
+		p.partialOverflow = false
+		p.partialTime = time.Time{}
+	}
+	p.mu.Unlock()
 
-		// Request readLoop to read next line on demand
-		p.requestLine()
+	if p.file != nil {
+		return p.readPollLine(ctx, promptStart)
+	}
+	return p.readStreamLine(ctx, promptStart)
+}
 
-		// Wait for line from readLoop, context cancellation, or prompter close
+func (p *TerminalPrompter) readPollLine(ctx context.Context, promptStart time.Time) (string, error) {
+	for {
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
 		case <-p.done:
 			return "", errPrompterClosed
-		case <-p.loopDone:
-			return "", errPrompterClosed
-		case res := <-p.linesChan:
-			if res.err != nil {
-				return "", res.err
+		default:
+		}
+
+		if !p.hasPendingInput(50) {
+			continue
+		}
+
+		b, err := p.reader.ReadByte()
+		now := time.Now()
+		if err != nil {
+			if p.isTTY && errors.Is(err, io.EOF) {
+				p.mu.Lock()
+				p.partialLine = p.partialLine[:0]
+				p.partialOverflow = false
+				p.partialTime = time.Time{}
+				p.mu.Unlock()
+				return "", io.EOF
 			}
 			p.mu.Lock()
-			start := p.promptStartTime
+			p.streamErr = err
 			p.mu.Unlock()
-			if !start.IsZero() && res.timestamp.Before(start) {
-				// Discard stale keystroke entered before prompt was presented
-				continue
-			}
-			return res.line, nil
+			return "", err
+		}
+
+		line, done, lineErr := p.appendLineByte(b, now, promptStart)
+		if done {
+			return line, lineErr
 		}
 	}
+}
+
+func (p *TerminalPrompter) readStreamLine(ctx context.Context, promptStart time.Time) (string, error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-p.done:
+			return "", errPrompterClosed
+		default:
+		}
+
+		for p.streamReadCh == nil && p.reader.Buffered() > 0 {
+			b, err := p.reader.ReadByte()
+			now := time.Now()
+			if err != nil {
+				p.mu.Lock()
+				p.streamErr = err
+				p.mu.Unlock()
+				return "", err
+			}
+			line, done, lineErr := p.appendLineByte(b, now, promptStart)
+			if done {
+				return line, lineErr
+			}
+		}
+
+		if p.streamReadCh == nil {
+			ch := make(chan streamByte, 1)
+			p.streamReadCh = ch
+			go func() {
+				b, err := p.reader.ReadByte()
+				ch <- streamByte{b: b, err: err, at: time.Now()}
+			}()
+		}
+
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-p.done:
+			return "", errPrompterClosed
+		case res := <-p.streamReadCh:
+			p.streamReadCh = nil
+			if res.err != nil {
+				p.mu.Lock()
+				p.streamErr = res.err
+				p.mu.Unlock()
+				return "", res.err
+			}
+			line, done, lineErr := p.appendLineByte(res.b, res.at, promptStart)
+			if done {
+				return line, lineErr
+			}
+		}
+	}
+}
+
+func (p *TerminalPrompter) appendLineByte(b byte, now, promptStart time.Time) (string, bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(p.partialLine) > 0 && !promptStart.IsZero() && p.partialTime.Before(promptStart) {
+		p.partialLine = p.partialLine[:0]
+		p.partialOverflow = false
+		p.partialTime = now
+	}
+	if len(p.partialLine) == 0 {
+		p.partialTime = now
+	}
+	if b == '\n' {
+		overflow := p.partialOverflow
+		line := string(p.partialLine) + "\n"
+		p.partialLine = p.partialLine[:0]
+		p.partialOverflow = false
+		p.partialTime = time.Time{}
+		if overflow {
+			return "", true, errors.New("input line exceeds maximum length")
+		}
+		return line, true, nil
+	}
+	if len(p.partialLine) < maxLineBuf {
+		p.partialLine = append(p.partialLine, b)
+	} else {
+		p.partialOverflow = true
+	}
+	return "", false, nil
 }
 
 // handleContextErr prints and returns appropriate cancellation or timeout decisions.
@@ -1306,6 +1321,11 @@ func (p *TerminalPrompter) handleContextErr(ctx context.Context, timeoutMsg stri
 
 // Prompt presents the request to the human operator and collects an explicit decision.
 func (p *TerminalPrompter) Prompt(ctx context.Context, req protocol.CommandRequest) (ApprovalDecision, string, string, error) {
+	if !p.enterOp() {
+		fmt.Fprintln(p.writer, "\n❌ Non-interactive or closed input stream. Request rejected.")
+		return DecisionReject, "", "Input stream closed or unavailable (EOF)", errPrompterClosed
+	}
+	defer p.leaveOp()
 	if p.isTTY && p.file != nil {
 		if fg, err := unix.IoctlGetInt(int(p.file.Fd()), unix.TIOCGPGRP); err == nil && fg > 0 {
 			if fg != syscall.Getpgrp() {

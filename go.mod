@@ -8,3 +8,5 @@ require (
 )
 
 require github.com/gorilla/websocket v1.5.3
+
+require golang.org/x/term v0.27.0

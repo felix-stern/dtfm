@@ -25,15 +25,23 @@ import (
 )
 
 type mockPrompter struct {
-	mu           sync.Mutex
-	decision     ApprovalDecision
-	editedCmd    string
-	rejectReason string
-	err          error
-	delay        time.Duration
-	called       chan struct{}
-	cancelled    chan error
-	onPrompt     func(ctx context.Context, req protocol.CommandRequest) (ApprovalDecision, string, string, error)
+	mu               sync.Mutex
+	decision         ApprovalDecision
+	editedCmd        string
+	rejectReason     string
+	err              error
+	delay            time.Duration
+	called           chan struct{}
+	cancelled        chan error
+	onPrompt         func(ctx context.Context, req protocol.CommandRequest) (ApprovalDecision, string, string, error)
+	onPromptPassword func(ctx context.Context) ([]byte, error)
+}
+
+func (m *mockPrompter) PromptPassword(ctx context.Context) ([]byte, error) {
+	if m.onPromptPassword != nil {
+		return m.onPromptPassword(ctx)
+	}
+	return nil, nil
 }
 
 func (m *mockPrompter) Prompt(ctx context.Context, req protocol.CommandRequest) (ApprovalDecision, string, string, error) {
@@ -2361,5 +2369,179 @@ func TestServerPersistentConnectionPipelining(t *testing.T) {
 				t.Fatalf("resp 3 ping mismatch: %+v", r3)
 			}
 		})
+	}
+}
+
+func TestServerModelCSudoPipingApproveAndEdit(t *testing.T) {
+	tmpDir := shortTempSockDir(t)
+	sockPath := filepath.Join(tmpDir, "s.sock")
+
+	fakeSudo := filepath.Join(tmpDir, "sudo")
+	script := `#!/bin/sh
+if [ "$1" != "-S" ] || [ "$2" != "-p" ] || [ "$3" != "" ]; then
+  echo "missing -S -p '' flags: $@" >&2
+  exit 2
+fi
+shift 3
+IFS= read -r pw
+if [ "$pw" != "s3cr3t-pass" ]; then
+  echo "bad password: $pw" >&2
+  exit 3
+fi
+echo "SUDO_OK:$*"
+`
+	if err := os.WriteFile(fakeSudo, []byte(script), 0755); err != nil {
+		t.Fatalf("Failed to write fake sudo script: %v", err)
+	}
+
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+	defer listener.Close()
+
+	var returnedSlice []byte
+	var pwCalls atomic.Int32
+	prompter := &mockPrompter{
+		onPrompt: func(ctx context.Context, req protocol.CommandRequest) (ApprovalDecision, string, string, error) {
+			if req.ID == "sudo-edit" {
+				return DecisionEdit, fakeSudo + " -S -p '' whoami-edited", "", nil
+			}
+			return DecisionApprove, "", "", nil
+		},
+		onPromptPassword: func(ctx context.Context) ([]byte, error) {
+			pwCalls.Add(1)
+			returnedSlice = []byte("s3cr3t-pass")
+			return returnedSlice, nil
+		},
+	}
+
+	server := NewServerWithExecutor(listener, prompter, NewCommandExecutor(io.Discard, io.Discard))
+	serveDone := startTestServer(t, server)
+	defer func() {
+		server.Shutdown()
+		<-serveDone
+	}()
+
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatalf("Dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	// 1. Direct sudo approval
+	req1 := protocol.CommandRequest{
+		ID:             "sudo-direct",
+		Reason:         "Test Model C sudo piping",
+		Command:        fakeSudo,
+		Args:           []string{"apt", "update"},
+		TimeoutSeconds: 5,
+	}
+	env1, _ := protocol.NewEnvelope(protocol.TypeExec, req1)
+	if err := json.NewEncoder(conn).Encode(env1); err != nil {
+		t.Fatalf("Encode req1 failed: %v", err)
+	}
+
+	var respEnv1 protocol.Envelope
+	if err := json.NewDecoder(conn).Decode(&respEnv1); err != nil {
+		t.Fatalf("Decode resp1 failed: %v", err)
+	}
+	var resp1 protocol.CommandResponse
+	_ = json.Unmarshal(respEnv1.Data, &resp1)
+	if resp1.Status != protocol.StatusApproved || resp1.ExitCode != 0 {
+		t.Fatalf("Expected StatusApproved (exit 0), got status=%s exit=%d stderr=%q err=%q",
+			resp1.Status, resp1.ExitCode, resp1.Stderr, resp1.Error)
+	}
+	if strings.TrimSpace(resp1.Stdout) != "SUDO_OK:apt update" {
+		t.Errorf("Unexpected stdout: %q", resp1.Stdout)
+	}
+	for i, b := range returnedSlice {
+		if b != 0 {
+			t.Fatalf("Password slice byte %d was not scrubbed by memclr: %d", i, b)
+		}
+	}
+
+	// 2. Edited command introducing sudo
+	req2 := protocol.CommandRequest{
+		ID:             "sudo-edit",
+		Reason:         "Test edited sudo piping",
+		Command:        "echo",
+		Args:           []string{"noop"},
+		TimeoutSeconds: 5,
+	}
+	env2, _ := protocol.NewEnvelope(protocol.TypeExec, req2)
+	if err := json.NewEncoder(conn).Encode(env2); err != nil {
+		t.Fatalf("Encode req2 failed: %v", err)
+	}
+
+	var respEnv2 protocol.Envelope
+	if err := json.NewDecoder(conn).Decode(&respEnv2); err != nil {
+		t.Fatalf("Decode resp2 failed: %v", err)
+	}
+	var resp2 protocol.CommandResponse
+	_ = json.Unmarshal(respEnv2.Data, &resp2)
+	if resp2.Status != protocol.StatusApproved || resp2.ExitCode != 0 {
+		t.Fatalf("Expected StatusApproved (exit 0) for edited sudo, got status=%s exit=%d stderr=%q",
+			resp2.Status, resp2.ExitCode, resp2.Stderr)
+	}
+	if strings.TrimSpace(resp2.Stdout) != "SUDO_OK:whoami-edited" {
+		t.Errorf("Unexpected edited sudo stdout: %q", resp2.Stdout)
+	}
+	if pwCalls.Load() != 2 {
+		t.Errorf("Expected PromptPassword to be called twice, got %d", pwCalls.Load())
+	}
+}
+
+func TestServerSudoPasswordTimeout(t *testing.T) {
+	tmpDir := shortTempSockDir(t)
+	sockPath := filepath.Join(tmpDir, "s.sock")
+
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+	defer listener.Close()
+
+	prompter := &mockPrompter{
+		decision: DecisionApprove,
+		onPromptPassword: func(ctx context.Context) ([]byte, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+
+	server := NewServerWithExecutor(listener, prompter, NewCommandExecutor(io.Discard, io.Discard))
+	serveDone := startTestServer(t, server)
+	defer func() {
+		server.Shutdown()
+		<-serveDone
+	}()
+
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatalf("Dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	req := protocol.CommandRequest{
+		ID:             "sudo-pw-timeout",
+		Reason:         "Test password timeout",
+		Command:        "sudo",
+		Args:           []string{"id"},
+		TimeoutSeconds: 1,
+	}
+	env, _ := protocol.NewEnvelope(protocol.TypeExec, req)
+	if err := json.NewEncoder(conn).Encode(env); err != nil {
+		t.Fatalf("Encode failed: %v", err)
+	}
+
+	var respEnv protocol.Envelope
+	if err := json.NewDecoder(conn).Decode(&respEnv); err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+	var resp protocol.CommandResponse
+	_ = json.Unmarshal(respEnv.Data, &resp)
+	if resp.Status != protocol.StatusTimeout || resp.ExitCode != protocol.ExitCodeTimeout {
+		t.Fatalf("Expected StatusTimeout (124) on password timeout, got status=%s exit=%d", resp.Status, resp.ExitCode)
 	}
 }

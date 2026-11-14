@@ -11,15 +11,99 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/iinozemtsev-lab/dtfm/pkg/protocol"
-	"golang.org/x/sys/unix"
 )
+
+// memclr zeroes out a byte slice in place and keeps it live past the loop
+// so dead-store optimization cannot elide password scrubbing.
+func memclr(b []byte) {
+	clear(b)
+	runtime.KeepAlive(b)
+}
+
+// commandNeedsSudo reports whether a direct command, arguments, or edited shell command invokes sudo.
+func commandNeedsSudo(cmd string, args []string, editedCmd string) bool {
+	if strings.TrimSpace(editedCmd) != "" {
+		return shellStringHasSudo(editedCmd)
+	}
+	base := filepath.Base(strings.TrimSpace(cmd))
+	if base == "sudo" {
+		return true
+	}
+	if base == "sh" || base == "bash" || base == "zsh" || base == "dash" {
+		for _, a := range args {
+			if shellStringHasSudo(a) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func shellStringHasSudo(s string) bool {
+	fields := strings.FieldsFunc(s, func(r rune) bool {
+		switch r {
+		case ' ', '\t', '\n', '\r', ';', '&', '|', '(', ')', '`', '"', '\'':
+			return true
+		default:
+			return false
+		}
+	})
+	for _, f := range fields {
+		if f == "sudo" || strings.HasSuffix(f, "/sudo") {
+			return true
+		}
+	}
+	return false
+}
+
+// prepareSudoArgs ensures -S (read password from stdin) and -p "" (suppress password prompt banner)
+// are passed when executing sudo directly or via a shell with a piped password.
+func prepareSudoArgs(cmd string, args []string) []string {
+	base := filepath.Base(strings.TrimSpace(cmd))
+	if base == "sh" || base == "bash" || base == "zsh" || base == "dash" {
+		out := make([]string, len(args))
+		copy(out, args)
+		for i := 0; i < len(out)-1; i++ {
+			if out[i] == "-c" && shellStringHasSudo(out[i+1]) {
+				out[i+1] = "sudo() { command sudo -S -p '' \"$@\"; }\n" + out[i+1]
+				break
+			}
+		}
+		return out
+	}
+	if base != "sudo" {
+		return args
+	}
+	hasStdinFlag := false
+	for _, a := range args {
+		if a == "--" {
+			break
+		}
+		if a == "-S" || a == "--stdin" {
+			hasStdinFlag = true
+			break
+		}
+		if strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.Contains(a[1:], "S") {
+			hasStdinFlag = true
+			break
+		}
+	}
+	if hasStdinFlag {
+		return args
+	}
+	out := make([]string, 0, len(args)+3)
+	out = append(out, "-S", "-p", "")
+	out = append(out, args...)
+	return out
+}
 
 // LimitedBuffer prevents unbounded memory consumption from rogue command output.
 type LimitedBuffer struct {
@@ -61,6 +145,7 @@ type ExecOptions struct {
 	Args            []string
 	Cwd             string
 	ModifiedCommand string
+	Password        []byte
 	StartTime       time.Time
 }
 
@@ -75,7 +160,7 @@ func (s *syncWriter) Write(p []byte) (n int, err error) {
 	return s.w.Write(p)
 }
 
-// CommandExecutor manages subprocess execution, foreground terminal handover, and lifecycle signals.
+// CommandExecutor manages subprocess execution, process-group isolation, and lifecycle signals.
 type CommandExecutor struct {
 	mu        sync.Mutex
 	writeMu   sync.Mutex
@@ -163,9 +248,15 @@ func (e *CommandExecutor) cancelledResponse(ctx context.Context, opts ExecOption
 	}
 }
 
-// Execute runs the approved binary directly with context timeout, terminal foreground control,
-// process group termination, and safe environment inheritance.
+// Execute runs the approved binary directly with context timeout, process-group isolation,
+// optional Model C sudo password piping (sudo -S), and safe environment inheritance.
 func (e *CommandExecutor) Execute(ctx context.Context, opts ExecOptions) protocol.CommandResponse {
+	defer func() {
+		if len(opts.Password) > 0 {
+			memclr(opts.Password)
+		}
+	}()
+
 	if ctx.Err() != nil {
 		duration := time.Since(opts.StartTime).Milliseconds()
 		return e.cancelledResponse(ctx, opts, "", "", duration)
@@ -177,84 +268,36 @@ func (e *CommandExecutor) Execute(ctx context.Context, opts ExecOptions) protoco
 		fmt.Fprintf(e.out, "⚡ Executing: %s\n", protocol.FormatCommand(opts.Command, opts.Args))
 	}
 
-	cmd := exec.CommandContext(ctx, opts.Command, opts.Args...)
+	execArgs := opts.Args
+	if opts.Password != nil {
+		execArgs = prepareSudoArgs(opts.Command, opts.Args)
+	}
+
+	cmd := exec.CommandContext(ctx, opts.Command, execArgs...)
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}
 
-	// Check if dtfm is running on an interactive controlling terminal (/dev/tty).
-	var ttyFile *os.File
-	if tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0); err == nil {
-		if fi, err := tty.Stat(); err == nil && (fi.Mode()&os.ModeCharDevice != 0) {
-			ttyFile = tty
-			defer ttyFile.Close()
-		} else {
-			_ = tty.Close()
-		}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
 	}
 
-	var isForeground bool
-	var origPgrp int
-	var origTermios *termiosState
-	if ttyFile != nil {
-		if fg, err := unix.IoctlGetInt(int(ttyFile.Fd()), unix.TIOCGPGRP); err == nil {
-			if fg == syscall.Getpgrp() {
-				isForeground = true
-				origPgrp = fg
-				// Save original termios state so child modifications (e.g. stty raw or stty -echo)
-				// are cleanly restored when the child finishes or is killed.
-				if t, err := getTermios(ttyFile.Fd()); err == nil {
-					origTermios = t
-					// Disable VSUSP (and VDSUSP on macOS) while dtfm is still the foreground process group,
-					// BEFORE cmd.Start() is called. This prevents race conditions where child programs
-					// (e.g. sudo or ssh) disable ECHO for password prompts and subsequent disableSusp calls
-					// overwrite the child's termios back to +echo.
-					signal.Ignore(syscall.SIGTTOU, syscall.SIGTTIN)
-					disableSusp(ttyFile.Fd(), origTermios)
-					signal.Reset(syscall.SIGTTOU, syscall.SIGTTIN)
-				}
+	var stdinPipe io.WriteCloser
+	if opts.Password != nil {
+		var pipeErr error
+		stdinPipe, pipeErr = cmd.StdinPipe()
+		if pipeErr != nil {
+			duration := time.Since(opts.StartTime).Milliseconds()
+			return protocol.CommandResponse{
+				ID:              opts.ID,
+				Status:          protocol.StatusError,
+				ModifiedCommand: opts.ModifiedCommand,
+				ExitCode:        protocol.ExitCodeError,
+				Error:           pipeErr.Error(),
+				DurationMs:      duration,
 			}
 		}
-	}
-
-	var restoreOnce sync.Once
-	restoreTTY := func() {
-		restoreOnce.Do(func() {
-			signal.Ignore(syscall.SIGTTOU, syscall.SIGTTIN)
-			defer signal.Reset(syscall.SIGTTOU, syscall.SIGTTIN)
-
-			// Restore original termios settings and flush pending input (TCSAFLUSH)
-			if isForeground && ttyFile != nil {
-				if origTermios != nil {
-					_ = restoreTermios(ttyFile.Fd(), origTermios)
-				}
-				// Restore dtfm's process group as the foreground group on the controlling TTY.
-				_ = unix.IoctlSetPointerInt(int(ttyFile.Fd()), unix.TIOCSPGRP, origPgrp)
-			}
-		})
-	}
-	defer restoreTTY()
-
-	if isForeground {
-		// Connected to an interactive terminal and dtfm is in the foreground:
-		// Make the child the foreground process group on the controlling TTY so
-		// commands like sudo, ssh, and stty can interact with the terminal without SIGTTOU/SIGTTIN.
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Foreground: true,
-			Ctty:       int(ttyFile.Fd()),
-		}
-	} else {
-		// Non-interactive / headless environment or background process:
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Setpgid: true,
-		}
-	}
-
-	// Stdin is deliberately connected to /dev/null rather than the TTY.
-	// Authenticators (sudo, ssh, pinentry) open /dev/tty directly and only need the foreground
-	// process group. Connecting stdin to /dev/null ensures programs like 'cat' or 'python'
-	// immediately receive EOF rather than hijacking the human operator's keyboard input.
-	if devNull, err := os.Open(os.DevNull); err == nil {
+	} else if devNull, err := os.Open(os.DevNull); err == nil {
 		cmd.Stdin = devNull
 		defer devNull.Close()
 	}
@@ -287,7 +330,9 @@ func (e *CommandExecutor) Execute(ctx context.Context, opts ExecOptions) protoco
 
 	startErr := cmd.Start()
 	if startErr != nil {
-		restoreTTY()
+		if stdinPipe != nil {
+			_ = stdinPipe.Close()
+		}
 		duration := time.Since(opts.StartTime).Milliseconds()
 		if ctx.Err() != nil {
 			return e.cancelledResponse(ctx, opts, stdoutBuf.String(), stderrBuf.String(), duration)
@@ -305,17 +350,21 @@ func (e *CommandExecutor) Execute(ctx context.Context, opts ExecOptions) protoco
 		}
 	}
 
-	// In parent, ignore SIGTTOU / SIGTTIN while child runs so parent cannot be suspended
-	// by terminal output or TTY state changes under stty tostop
-	signal.Ignore(syscall.SIGTTOU, syscall.SIGTTIN)
+	if stdinPipe != nil {
+		pwBuf := make([]byte, len(opts.Password)+1)
+		copy(pwBuf, opts.Password)
+		pwBuf[len(opts.Password)] = '\n'
+		memclr(opts.Password)
+		_, _ = stdinPipe.Write(pwBuf)
+		memclr(pwBuf)
+		_ = stdinPipe.Close()
+	}
 
 	e.SetActiveChild(cmd.Process.Pid)
 	defer e.SetActiveChild(0)
 
 	err := cmd.Wait()
 	e.SetActiveChild(0)
-	restoreTTY()
-	signal.Reset(syscall.SIGTTOU, syscall.SIGTTIN)
 
 	duration := time.Since(opts.StartTime).Milliseconds()
 
@@ -360,7 +409,11 @@ func (e *CommandExecutor) Execute(ctx context.Context, opts ExecOptions) protoco
 }
 
 // ExecuteShell runs an operator-edited command via bash (or sh fallback) with profile/rc loading disabled.
-func (e *CommandExecutor) ExecuteShell(ctx context.Context, id, shellCmd string, cwd string, start time.Time) protocol.CommandResponse {
+func (e *CommandExecutor) ExecuteShell(ctx context.Context, id, shellCmd string, cwd string, start time.Time, password ...[]byte) protocol.CommandResponse {
+	var pw []byte
+	if len(password) > 0 {
+		pw = password[0]
+	}
 	shellPath := "bash"
 	shellArgs := []string{"--noprofile", "--norc", "-c", shellCmd}
 	if p, err := exec.LookPath("bash"); err == nil && p != "" {
@@ -379,6 +432,7 @@ func (e *CommandExecutor) ExecuteShell(ctx context.Context, id, shellCmd string,
 		Args:            shellArgs,
 		Cwd:             cwd,
 		ModifiedCommand: shellCmd,
+		Password:        pw,
 		StartTime:       start,
 	})
 }

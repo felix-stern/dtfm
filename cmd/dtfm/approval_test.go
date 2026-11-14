@@ -156,11 +156,11 @@ func TestApprovalStaleKeystrokesDrainedNonVacuous(t *testing.T) {
 	prompter := NewStreamPrompter(pr, new(bytes.Buffer))
 	defer prompter.Close()
 
-	// Put stale "y\n" into linesChan timestamped before promptStartTime
-	prompter.linesChan <- lineResult{
-		line:      "y\n",
-		timestamp: time.Now().Add(-100 * time.Millisecond),
-	}
+	// Put stale partial "y" into partialLine timestamped before promptStartTime
+	prompter.mu.Lock()
+	prompter.partialLine = []byte("y")
+	prompter.partialTime = time.Now().Add(-100 * time.Millisecond)
+	prompter.mu.Unlock()
 
 	// Now schedule the real answer "n\n" and reject reason "Declined\n"
 	go func() {
@@ -370,11 +370,6 @@ func TestTermiosSaveAndRestore(t *testing.T) {
 	// Restore termios settings
 	if err := restoreTermios(pts.Fd(), initial); err != nil {
 		t.Fatalf("Failed to restore termios: %v", err)
-	}
-
-	// Verify terminal flush works on the PTY
-	if err := flushTTYInput(pts.Fd()); err != nil {
-		t.Fatalf("Failed to flush TTY input on PTY: %v", err)
 	}
 }
 
@@ -2078,5 +2073,104 @@ func TestPTYWideSymbolColumnBounds(t *testing.T) {
 	out := stdout.String()
 	if !strings.Contains(out, "> <") {
 		t.Errorf("Expected redraw output to contain horizontal scroll marker '> <' for wide symbols")
+	}
+}
+
+func TestCommandNeedsSudoAndPrepareSudoArgs(t *testing.T) {
+	if !commandNeedsSudo("sudo", []string{"apt", "update"}, "") {
+		t.Error("Expected direct sudo command to require sudo")
+	}
+	if !commandNeedsSudo("/usr/bin/sudo", []string{"id"}, "") {
+		t.Error("Expected /usr/bin/sudo to require sudo")
+	}
+	if !commandNeedsSudo("bash", []string{"-c", "echo hi && sudo id"}, "") {
+		t.Error("Expected bash -c with sudo to require sudo")
+	}
+	if commandNeedsSudo("echo", []string{"sudo"}, "") {
+		t.Error("Expected 'echo sudo' not to require sudo")
+	}
+	if !commandNeedsSudo("echo", []string{"hi"}, "sudo whoami") {
+		t.Error("Expected edited command containing sudo to require sudo")
+	}
+	if commandNeedsSudo("sudo", []string{"id"}, "id") {
+		t.Error("Expected edited command removing sudo not to require sudo")
+	}
+
+	got := prepareSudoArgs("sudo", []string{"apt", "update"})
+	want := []string{"-S", "-p", "", "apt", "update"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("prepareSudoArgs mismatch: got %v, want %v", got, want)
+	}
+
+	gotAlready := prepareSudoArgs("sudo", []string{"-S", "apt", "update"})
+	if len(gotAlready) != 3 || gotAlready[0] != "-S" {
+		t.Errorf("Expected existing -S not to be duplicated, got %v", gotAlready)
+	}
+
+	gotCombined := prepareSudoArgs("sudo", []string{"-kS", "id"})
+	if len(gotCombined) != 2 || gotCombined[0] != "-kS" {
+		t.Errorf("Expected combined -kS flag not to duplicate -S, got %v", gotCombined)
+	}
+
+	gotShell := prepareSudoArgs("bash", []string{"--noprofile", "--norc", "-c", "sudo id"})
+	if len(gotShell) != 4 || !strings.Contains(gotShell[3], "command sudo -S -p ''") {
+		t.Errorf("Expected shell -c sudo wrapper injection, got %v", gotShell)
+	}
+}
+
+func TestMemclrScrubsPassword(t *testing.T) {
+	pw := []byte("super-secret-sudo-password")
+	memclr(pw)
+	for i, b := range pw {
+		if b != 0 {
+			t.Fatalf("Expected byte %d to be 0 after memclr, got %d", i, b)
+		}
+	}
+}
+
+func TestPromptPasswordPTYNoEchoAndTimeout(t *testing.T) {
+	ptmx, pts, err := pty.Open()
+	if err != nil {
+		t.Fatalf("Failed to open PTY: %v", err)
+	}
+	defer ptmx.Close()
+	defer pts.Close()
+
+	var ptyOut syncBuffer
+	go func() {
+		_, _ = io.Copy(&ptyOut, ptmx)
+	}()
+
+	var stdout syncBuffer
+	prompter := newPrompter(pts, &stdout, pts)
+	defer prompter.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		if !waitForPromptOutput(&stdout, "🔑 [sudo] Password:", 1*time.Second) {
+			return
+		}
+		_, _ = ptmx.Write([]byte("hunter2-secret\n"))
+	}()
+
+	pw, err := prompter.PromptPassword(ctx)
+	if err != nil {
+		t.Fatalf("PromptPassword failed: %v", err)
+	}
+	if string(pw) != "hunter2-secret" {
+		t.Fatalf("Expected password %q, got %q", "hunter2-secret", string(pw))
+	}
+	if strings.Contains(ptyOut.String(), "hunter2-secret") {
+		t.Errorf("Password was echoed to PTY output: %q", ptyOut.String())
+	}
+
+	// Verify timeout when no password is entered
+	shortCtx, shortCancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer shortCancel()
+	_, err = prompter.PromptPassword(shortCtx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Expected context.DeadlineExceeded on password timeout, got %v", err)
 	}
 }
