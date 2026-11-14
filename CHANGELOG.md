@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-14
+
 ### Added
 - Automatic operator WebSocket reconnection with jittered exponential backoff (`1s`–`5s`) in `dtfm --relay`, preserving active Magic Links and session IDs across relay idle-timeout evictions, server restarts, and transient network drops with connection-generation isolation and immediate shutdown cancellation.
 - Pipe-safe POSIX installer (`scripts/install.sh`) with rate-limit-free release tag resolution, `SHA256SUMS` verification, `relay` to `dtfm-relay` binary mapping, symlink guard, atomic binary staging, and hermetic local HTTP test suite (`scripts/test_install.py`) wired into CI.
@@ -68,7 +70,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Build Infrastructure**:
   - Multi-platform static compilation targets in `Makefile` (`make cross`) for `darwin-arm64`, `darwin-amd64`, `linux-amd64`, and `linux-arm64` (`CGO_ENABLED=0`).
 
-[Unreleased]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/iinozemtsev-lab/dtfm/compare/6d8f9d2...v0.2.0
