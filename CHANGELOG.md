@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Rendered multiline command arguments inside a numbered left gutter (`1 │ ...`) in `dtfm` approval prompts and compact line-count badges (`‹arg[N]: M lines›`) in execution banners instead of single-line `$'...\n...'` ANSI-C walls of text, while preserving full `[e]` inline-edit `$'...'` syntax and highlighting escaped control/bidi characters in bold red.
+
 ## [0.3.1] - 2026-11-14
 
 ### Added

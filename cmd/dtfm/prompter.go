@@ -16,6 +16,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/iinozemtsev-lab/dtfm/pkg/protocol"
 	"golang.org/x/sys/unix"
@@ -208,6 +209,7 @@ func (p *TerminalPrompter) Prompt(ctx context.Context, req protocol.CommandReque
 	// Sanitize all untrusted agent inputs without deleting bytes
 	cleanReason := protocol.SanitizeTerminalText(req.Reason)
 	cleanCmd := protocol.FormatCommand(req.Command, req.Args)
+	displayCmd, totalCmdLines, flatCmdPreview := p.formatCommandDisplay(req, cleanCmd)
 	cleanCwd := protocol.SanitizeTerminalText(req.Cwd)
 	displayCwd := cleanCwd
 	if len([]rune(displayCwd)) > 240 {
@@ -227,10 +229,11 @@ func (p *TerminalPrompter) Prompt(ctx context.Context, req protocol.CommandReque
 		displayReason = string([]rune(cleanReason)[:500]) + "... [truncated]"
 	}
 
-	fmt.Fprintln(p.writer, "────────────────────────────────────────────────────────────")
-	fmt.Fprintln(p.writer, "🔔 LMDTFY Command Execution Request:")
-	fmt.Fprintf(p.writer, "   Reason:  %s\n", p.colorBlue(displayReason))
-	fmt.Fprintf(p.writer, "   Command: %s\n", p.colorGreen(cleanCmd))
+	var banner strings.Builder
+	fmt.Fprintln(&banner, "────────────────────────────────────────────────────────────")
+	fmt.Fprintln(&banner, "🔔 LMDTFY Command Execution Request:")
+	fmt.Fprintf(&banner, "   Reason:  %s\n", p.colorBlue(displayReason))
+	fmt.Fprintf(&banner, "   Command: %s\n", displayCmd)
 	if cleanCwd != "" {
 		cwdWarning := ""
 		if st, err := os.Stat(req.Cwd); err != nil || !st.IsDir() {
@@ -246,7 +249,7 @@ func (p *TerminalPrompter) Prompt(ctx context.Context, req protocol.CommandReque
 				}
 			}
 		}
-		fmt.Fprintf(p.writer, "   Cwd:     %s%s\n", p.colorBlue(displayCwd), cwdWarning)
+		fmt.Fprintf(&banner, "   Cwd:     %s%s\n", p.colorBlue(displayCwd), cwdWarning)
 	}
 
 	// Sanitize every blocked key so terminal escapes (CSI/OSC) cannot spoof output
@@ -255,28 +258,44 @@ func (p *TerminalPrompter) Prompt(ctx context.Context, req protocol.CommandReque
 		for i, k := range blockedKeys {
 			sanitizedBlocked[i] = protocol.SanitizeTerminalText(k)
 		}
-		fmt.Fprintf(p.writer, "   %s %s\n", p.colorRed("⚠️  BLOCKED DANGEROUS / MALFORMED ENV VARS:"), strings.Join(sanitizedBlocked, ", "))
+		fmt.Fprintf(&banner, "   %s %s\n", p.colorRed("⚠️  BLOCKED DANGEROUS / MALFORMED ENV VARS:"), strings.Join(sanitizedBlocked, ", "))
 	}
 
 	// Display clean environment variables in deterministic sorted order
 	if len(cleanEnv) > 0 {
-		fmt.Fprintln(p.writer, "   Environment:")
+		fmt.Fprintln(&banner, "   Environment:")
 		sortedKeys := make([]string, 0, len(cleanEnv))
 		for k := range cleanEnv {
 			sortedKeys = append(sortedKeys, k)
 		}
 		sort.Strings(sortedKeys)
 		for _, k := range sortedKeys {
-			fmt.Fprintf(p.writer, "      %s=%s\n", protocol.SanitizeTerminalText(k), protocol.SanitizeTerminalText(cleanEnv[k]))
+			fmt.Fprintf(&banner, "      %s=%s\n", protocol.SanitizeTerminalText(k), protocol.SanitizeTerminalText(cleanEnv[k]))
 		}
 	}
-	fmt.Fprintln(p.writer, "────────────────────────────────────────────────────────────")
-	if len(cleanCmd) > 300 || len(cleanReason) > 300 || len(cleanCwd) > 200 {
-		cmdRunes := []rune(cleanCmd)
-		cmdPreview := cleanCmd
-		if len(cmdRunes) > 160 {
-			cmdPreview = string(cmdRunes[:100]) + " ... [truncated] ... " + string(cmdRunes[len(cmdRunes)-60:])
-			fmt.Fprintf(p.writer, "   %s\n", p.colorRed(fmt.Sprintf("⚠️  Full command exceeds viewport (%d chars, %d args) — scroll up to inspect before approving", len(cmdRunes), len(req.Args))))
+	fmt.Fprintln(&banner, "────────────────────────────────────────────────────────────")
+
+	bannerStr := banner.String()
+	fmt.Fprint(p.writer, bannerStr)
+
+	termCols, termRows := p.getTerminalSize()
+	renderedRows := countRenderedRows(bannerStr, termCols)
+	viewportRowLimit := max(termRows-4, 10)
+	cmdRunes := []rune(cleanCmd)
+	previewRunes := []rune(flatCmdPreview)
+	cmdExceedsViewport := renderedRows > viewportRowLimit || len(previewRunes) > 160 || len(cmdRunes) > 160
+
+	if cmdExceedsViewport || len(cleanReason) > 300 || len(cleanCwd) > 200 {
+		cmdPreview := flatCmdPreview
+		if len(previewRunes) > 160 {
+			cmdPreview = string(previewRunes[:100]) + " ... [truncated] ... " + string(previewRunes[len(previewRunes)-60:])
+		}
+		if cmdExceedsViewport {
+			if totalCmdLines > 1 {
+				fmt.Fprintf(p.writer, "   %s\n", p.colorRed(fmt.Sprintf("⚠️  Full command exceeds viewport (%d lines, %d chars, %d args) — scroll up to inspect before approving", totalCmdLines, len(cmdRunes), len(req.Args))))
+			} else {
+				fmt.Fprintf(p.writer, "   %s\n", p.colorRed(fmt.Sprintf("⚠️  Full command exceeds viewport (%d chars, %d args) — scroll up to inspect before approving", len(cmdRunes), len(req.Args))))
+			}
 		}
 		if cleanCwd != "" {
 			fmt.Fprintf(p.writer, "   Target:  %s (cwd: %s)\n", cmdPreview, targetCwd)
@@ -401,4 +420,123 @@ func (p *TerminalPrompter) Prompt(ctx context.Context, req protocol.CommandReque
 			p.mu.Unlock()
 		}
 	}
+}
+
+// getTerminalSize returns the current terminal width and height via TIOCGWINSZ when
+// attached to a TTY, defaulting independently per dimension to 80x24 when unavailable.
+func (p *TerminalPrompter) getTerminalSize() (cols, rows int) {
+	cols, rows = 80, 24
+	if p.isTTY && p.file != nil {
+		if ws, err := unix.IoctlGetWinsize(int(p.file.Fd()), unix.TIOCGWINSZ); err == nil {
+			if ws.Col > 0 {
+				cols = int(ws.Col)
+			}
+			if ws.Row > 0 {
+				rows = int(ws.Row)
+			}
+		}
+	}
+	return cols, rows
+}
+
+// visibleLineWidth returns the terminal column width of s after stripping ANSI CSI SGR sequences.
+func visibleLineWidth(s string) int {
+	width := 0
+	for i := 0; i < len(s); {
+		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
+			j := i + 2
+			for j < len(s) && (s[j] < 0x40 || s[j] > 0x7E) {
+				j++
+			}
+			if j < len(s) {
+				i = j + 1
+				continue
+			}
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		i += size
+		width += runeDisplayWidth(r)
+	}
+	return width
+}
+
+// countRenderedRows computes how many terminal rows banner occupies at width termCols,
+// accounting for embedded newlines, banner chrome, block headers, and horizontal line wrapping.
+func countRenderedRows(banner string, termCols int) int {
+	if termCols <= 0 {
+		termCols = 80
+	}
+	banner = strings.TrimSuffix(banner, "\n")
+	if banner == "" {
+		return 0
+	}
+	rows := 0
+	for _, line := range strings.Split(banner, "\n") {
+		w := visibleLineWidth(line)
+		if w <= 0 {
+			rows++
+		} else {
+			rows += (w + termCols - 1) / termCols
+		}
+	}
+	return rows
+}
+
+// formatCommandDisplay renders single-line commands inline via FormatCommand, and renders
+// multiline arguments inside a numbered left gutter ("   1 │ ...") so heredocs and scripts
+// remain effortless to audit without compromising terminal-escape or prompt-spoofing defenses.
+func (p *TerminalPrompter) formatCommandDisplay(req protocol.CommandRequest, cleanCmd string) (display string, totalLines int, flatPreview string) {
+	tokens, multilineCount := protocol.InspectCommandTokens(req.Command, req.Args)
+	if multilineCount == 0 {
+		return p.colorGreen(cleanCmd), 1, strings.Join(strings.Fields(cleanCmd), " ")
+	}
+
+	headerParts := make([]string, len(tokens))
+	for i, tok := range tokens {
+		switch {
+		case tok.Multiline && tok.Index == 0:
+			headerParts[i] = p.colorRed(tok.Badge)
+		case tok.Multiline:
+			headerParts[i] = p.colorBlue(tok.Badge)
+		default:
+			headerParts[i] = p.colorGreen(tok.Quoted)
+		}
+	}
+
+	var highlightFn func(string) string
+	if p.useColor() {
+		highlightFn = p.colorRed
+	}
+
+	var b strings.Builder
+	b.WriteString(strings.Join(headerParts, " "))
+
+	var previewSegments []string
+	for _, tok := range tokens {
+		if !tok.Multiline {
+			continue
+		}
+		lines := strings.Split(tok.Raw, "\n")
+		totalLines += len(lines)
+		if tok.Index == 0 {
+			fmt.Fprintf(&b, "\n     %s", p.colorRed(fmt.Sprintf("┌─ %s (%d lines):", tok.Label, len(lines))))
+		} else if multilineCount > 1 {
+			fmt.Fprintf(&b, "\n     %s", p.colorBlue(fmt.Sprintf("┌─ %s (%d lines):", tok.Label, len(lines))))
+		}
+		numWidth := max(len(fmt.Sprintf("%d", len(lines))), 4)
+		for idx, line := range lines {
+			styledLine, plainLine := protocol.SanitizeDisplayLinePair(line, highlightFn)
+			gutter := p.colorDim(fmt.Sprintf("  %*d │ ", numWidth, idx+1))
+			fmt.Fprintf(&b, "\n%s%s", gutter, styledLine)
+			if collapsed := strings.Join(strings.Fields(plainLine), " "); collapsed != "" {
+				previewSegments = append(previewSegments, collapsed)
+			}
+		}
+	}
+
+	flatPreview = strings.Join(strings.Fields(protocol.FormatCompactTokens(tokens)), " ")
+	if len(previewSegments) > 0 {
+		flatPreview += " — " + strings.Join(previewSegments, " ↵ ")
+	}
+	return b.String(), totalLines, flatPreview
 }

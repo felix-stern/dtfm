@@ -174,7 +174,7 @@ func (e *CommandExecutor) Execute(ctx context.Context, opts ExecOptions) protoco
 	if opts.ModifiedCommand != "" {
 		fmt.Fprintf(e.out, "⚡ Executing (edited): %s\n", protocol.SanitizeBannerCommand(opts.ModifiedCommand))
 	} else {
-		fmt.Fprintf(e.out, "⚡ Executing: %s\n", protocol.FormatCommand(opts.Command, opts.Args))
+		fmt.Fprintf(e.out, "⚡ Executing: %s\n", protocol.FormatCompactCommand(opts.Command, opts.Args))
 	}
 
 	cmd := exec.CommandContext(ctx, opts.Command, opts.Args...)

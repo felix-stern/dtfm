@@ -113,10 +113,6 @@ func IsBidiOverride(r rune) bool {
 	return (r >= 0x202A && r <= 0x202E) || (r >= 0x2066 && r <= 0x2069) || r == 0x200E || r == 0x200F
 }
 
-func isBidiOverride(r rune) bool {
-	return IsBidiOverride(r)
-}
-
 // NeedsEscape returns true if rune r requires escaping to be safely displayed on a terminal.
 // Explicit checks for control codes, NBSP, bidirectional overrides, combining marks,
 // formatting/variation selectors, and invisible blank fillers prevent visual spoofing.
@@ -125,10 +121,6 @@ func NeedsEscape(r rune) bool {
 		unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Me, r) || unicode.Is(unicode.Cf, r) ||
 		(r >= 0xFE00 && r <= 0xFE0F) || (r >= 0xE0100 && r <= 0xE01EF) ||
 		r == 0x034F || r == 0x115F || r == 0x1160 || r == 0x2800 || r == 0x3164 || r == 0xFFA0
-}
-
-func needsEscape(r rune) bool {
-	return NeedsEscape(r)
 }
 
 // SanitizeTerminalText makes arbitrary text safe to print to an operator's terminal
@@ -149,7 +141,7 @@ func SanitizeTerminalText(s string) string {
 		switch {
 		case r == '\x1b' || r == '\n' || r == '\r' || r == '\t' || r == '\a' || r == '\b' || r == '\v' || r == '\f' || r == '\\':
 			escapeRune(&b, r)
-		case needsEscape(r):
+		case NeedsEscape(r):
 			escapeRune(&b, r)
 		default:
 			b.WriteRune(r)
@@ -167,7 +159,7 @@ func needsAnsiCQuote(s string) bool {
 			return true
 		}
 		i += size
-		if r == '\x1b' || needsEscape(r) {
+		if r == '\x1b' || NeedsEscape(r) {
 			return true
 		}
 	}
@@ -255,20 +247,193 @@ func SanitizeBannerCommand(s string) string {
 	return b.String()
 }
 
+// QuoteCommandName quotes argv[0] so that a binary name containing '=' (e.g. DRY_RUN=1)
+// is always quoted and never resembles a shell environment assignment prefix.
+func QuoteCommandName(command string) string {
+	cmdQuoted := ShellQuote(command)
+	if strings.Contains(command, "=") && !strings.HasPrefix(cmdQuoted, "'") && !strings.HasPrefix(cmdQuoted, "$'") {
+		cmdQuoted = "'" + strings.ReplaceAll(command, "'", `'\''`) + "'"
+	}
+	return cmdQuoted
+}
+
 // FormatCommand formats a command and its arguments into an unambiguous, lossless shell string.
 // If the command contains '=' (e.g. DRY_RUN=1), it is always quoted to avoid looking like a shell assignment prefix.
 // No bytes from the arguments are ever deleted or stripped.
 func FormatCommand(command string, args []string) string {
 	parts := make([]string, 0, len(args)+1)
-	cmdQuoted := ShellQuote(command)
-	if strings.Contains(command, "=") && !strings.HasPrefix(cmdQuoted, "'") && !strings.HasPrefix(cmdQuoted, "$'") {
-		cmdQuoted = "'" + strings.ReplaceAll(command, "'", `'\''`) + "'"
-	}
-	parts = append(parts, cmdQuoted)
+	parts = append(parts, QuoteCommandName(command))
 	for _, arg := range args {
 		parts = append(parts, ShellQuote(arg))
 	}
 	return strings.Join(parts, " ")
+}
+
+// CommandToken describes a single argv element (Index 0 for Command, Index >= 1 for Args)
+// classified in a single pass for header badges and multiline gutter rendering.
+type CommandToken struct {
+	Index     int    // 0 for Command, 1..len(Args) for Args
+	Label     string // "cmd" for Index 0, "arg[i]" for Index >= 1
+	Raw       string // Original unquoted token string
+	Quoted    string // Single-line shell-quoted token (populated when !Multiline)
+	Badge     string // Compact multiline placeholder e.g. "‹arg[2]: 37 lines›" (populated when Multiline)
+	LineCount int    // Number of '\n'-delimited lines (>= 2 when Multiline, 1 otherwise)
+	Multiline bool   // True iff Raw contains '\n'
+}
+
+// InspectCommandTokens classifies command and args into display tokens in a single pass,
+// sharing badge formatting between FormatCompactCommand and TerminalPrompter.
+// Note that a literal single-line argument containing "‹arg[2]: 4 lines›" is quoted via
+// ShellQuote ("'‹arg[2]: 4 lines›'"), keeping it strictly distinct from an unquoted Badge.
+func InspectCommandTokens(command string, args []string) (tokens []CommandToken, multilineCount int) {
+	tokens = make([]CommandToken, 0, len(args)+1)
+	addToken := func(idx int, raw string) {
+		label := "cmd"
+		if idx > 0 {
+			label = fmt.Sprintf("arg[%d]", idx)
+		}
+		if nl := strings.Count(raw, "\n"); nl > 0 {
+			multilineCount++
+			lines := nl + 1
+			tokens = append(tokens, CommandToken{
+				Index:     idx,
+				Label:     label,
+				Raw:       raw,
+				Badge:     fmt.Sprintf("‹%s: %d lines›", label, lines),
+				LineCount: lines,
+				Multiline: true,
+			})
+			return
+		}
+		quoted := ShellQuote(raw)
+		if idx == 0 {
+			quoted = QuoteCommandName(raw)
+		}
+		tokens = append(tokens, CommandToken{
+			Index:     idx,
+			Label:     label,
+			Raw:       raw,
+			Quoted:    quoted,
+			LineCount: 1,
+		})
+	}
+
+	addToken(0, command)
+	for i, arg := range args {
+		addToken(i+1, arg)
+	}
+	return tokens, multilineCount
+}
+
+// HasMultilineArgs reports whether command or any element of args contains a newline ('\n').
+func HasMultilineArgs(command string, args []string) bool {
+	if strings.Contains(command, "\n") {
+		return true
+	}
+	for _, arg := range args {
+		if strings.Contains(arg, "\n") {
+			return true
+		}
+	}
+	return false
+}
+
+// FormatCompactTokens joins pre-inspected CommandTokens into a compact single-line summary,
+// replacing any multiline token with its line-count badge while shell-quoting single-line tokens.
+func FormatCompactTokens(tokens []CommandToken) string {
+	parts := make([]string, len(tokens))
+	for i, tok := range tokens {
+		if tok.Multiline {
+			parts[i] = tok.Badge
+		} else {
+			parts[i] = tok.Quoted
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// FormatCompactCommand formats single-line invocations identically to FormatCommand,
+// while replacing any multiline command/argument token with a concise line-count badge
+// (e.g. "bash -c ‹arg[2]: 37 lines›") suitable for compact headers and execution banners.
+func FormatCompactCommand(command string, args []string) string {
+	tokens, _ := InspectCommandTokens(command, args)
+	return FormatCompactTokens(tokens)
+}
+
+// SanitizeDisplayLine sanitizes a single line of a multiline argument for gutter-boxed terminal display.
+// Because this output is used strictly for human review display (while [e] inline edit uses lossless
+// FormatCommand $'...' quoting and direct execution passes the original req.Command / req.Args slice to execvp),
+// printable characters — including single/double quotes and literal backslashes — render naturally without
+// $'...' quoting noise, and tabs expand to 4 spaces to avoid right-margin VT100 tab truncation.
+// Every control code, carriage return, ANSI escape, invalid UTF-8 byte, and Trojan Source bidi/invisible rune
+// matched by NeedsEscape is visibly escaped (optionally wrapped by highlightEscape, e.g. bold red on TTYs).
+func SanitizeDisplayLine(line string, highlightEscape func(string) string) string {
+	styled, _ := SanitizeDisplayLinePair(line, highlightEscape)
+	return styled
+}
+
+// SanitizeDisplayLinePair performs a single-pass sanitization of line, returning both the styled line
+// (with escaped sequences wrapped by highlightEscape when non-nil) and the plain unstyled sanitized line.
+func SanitizeDisplayLinePair(line string, highlightEscape func(string) string) (styled string, plain string) {
+	var styledBuf strings.Builder
+	var plainBuf strings.Builder
+	var escBuf strings.Builder
+	hasStyledEscape := false
+
+	writePlainText := func(s string) {
+		styledBuf.WriteString(s)
+		if hasStyledEscape {
+			plainBuf.WriteString(s)
+		}
+	}
+	writePlainRune := func(r rune) {
+		styledBuf.WriteRune(r)
+		if hasStyledEscape {
+			plainBuf.WriteRune(r)
+		}
+	}
+	writeEsc := func(esc string) {
+		if highlightEscape != nil {
+			wrapped := highlightEscape(esc)
+			if wrapped != esc {
+				if !hasStyledEscape {
+					hasStyledEscape = true
+					plainBuf.WriteString(styledBuf.String())
+				}
+				styledBuf.WriteString(wrapped)
+				plainBuf.WriteString(esc)
+				return
+			}
+		}
+		writePlainText(esc)
+	}
+
+	for i := 0; i < len(line); {
+		r, size := utf8.DecodeRuneInString(line[i:])
+		if r == utf8.RuneError && size == 1 {
+			writeEsc(fmt.Sprintf(`\x%02x`, line[i]))
+			i++
+			continue
+		}
+		i += size
+
+		switch {
+		case r == '\t':
+			writePlainText("    ")
+		case NeedsEscape(r):
+			escBuf.Reset()
+			escapeRune(&escBuf, r)
+			writeEsc(escBuf.String())
+		default:
+			writePlainRune(r)
+		}
+	}
+
+	styled = styledBuf.String()
+	if hasStyledEscape {
+		return styled, plainBuf.String()
+	}
+	return styled, styled
 }
 
 // IsDangerousEnv returns true if the environment variable name poses a security risk

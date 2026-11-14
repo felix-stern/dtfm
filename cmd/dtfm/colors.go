@@ -36,3 +36,10 @@ func (p *TerminalPrompter) colorBold(s string) string {
 	}
 	return "\033[1m" + s + "\033[0m"
 }
+
+func (p *TerminalPrompter) colorDim(s string) string {
+	if !p.useColor() {
+		return s
+	}
+	return "\033[2m" + s + "\033[0m"
+}
