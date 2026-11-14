@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-14
+
 ### Added
 - Cryptographically signed SLSA v1.0 build provenance and artifact attestations for all release archives, standalone binaries, and checksum files in `.github/workflows/release.yml` using `actions/attest-build-provenance@v4`, with least-privilege hermetic build isolation and pre-publish attestation verification ([#31](https://github.com/iinozemtsev-lab/dtfm/issues/31)).
 
@@ -58,7 +60,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Build Infrastructure**:
   - Multi-platform static compilation targets in `Makefile` (`make cross`) for `darwin-arm64`, `darwin-amd64`, `linux-amd64`, and `linux-arm64` (`CGO_ENABLED=0`).
 
-[Unreleased]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/iinozemtsev-lab/dtfm/compare/6d8f9d2...v0.2.0
 [0.1.0]: https://github.com/iinozemtsev-lab/dtfm/commit/6d8f9d2
