@@ -120,9 +120,57 @@ func (e *CommandExecutor) ActiveChildPid() int {
 	return e.activePid
 }
 
+func cancelRejectReason(cause error) string {
+	switch {
+	case errors.Is(cause, ErrServerShutdown):
+		return "Server is shutting down"
+	case errors.Is(cause, ErrClientDisconnected):
+		return "Client disconnected during command execution"
+	default:
+		return fmt.Sprintf("Command execution cancelled: %v", cause)
+	}
+}
+
+func (e *CommandExecutor) cancelledResponse(ctx context.Context, opts ExecOptions, stdout, stderr string, duration int64) protocol.CommandResponse {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		fmt.Fprintf(e.out, "\n⏳ Command execution TIMED OUT (%d ms)\n\n", duration)
+		return protocol.CommandResponse{
+			ID:              opts.ID,
+			Status:          protocol.StatusTimeout,
+			ModifiedCommand: opts.ModifiedCommand,
+			ExitCode:        protocol.ExitCodeTimeout,
+			Stdout:          stdout,
+			Stderr:          stderr,
+			Error:           "Command execution timed out",
+			DurationMs:      duration,
+		}
+	}
+	cause := context.Cause(ctx)
+	if cause == nil {
+		cause = ctx.Err()
+	}
+	fmt.Fprintf(e.out, "\n🔌 Command execution cancelled (%v)\n\n", cause)
+	return protocol.CommandResponse{
+		ID:              opts.ID,
+		Status:          protocol.StatusRejected,
+		RejectReason:    cancelRejectReason(cause),
+		ModifiedCommand: opts.ModifiedCommand,
+		ExitCode:        protocol.ExitCodeRejected,
+		Stdout:          stdout,
+		Stderr:          stderr,
+		Error:           fmt.Sprintf("Command execution cancelled: %v", cause),
+		DurationMs:      duration,
+	}
+}
+
 // Execute runs the approved binary directly with context timeout, terminal foreground control,
 // process group termination, and safe environment inheritance.
 func (e *CommandExecutor) Execute(ctx context.Context, opts ExecOptions) protocol.CommandResponse {
+	if ctx.Err() != nil {
+		duration := time.Since(opts.StartTime).Milliseconds()
+		return e.cancelledResponse(ctx, opts, "", "", duration)
+	}
+
 	if opts.ModifiedCommand != "" {
 		fmt.Fprintf(e.out, "⚡ Executing (edited): %s\n", protocol.SanitizeBannerCommand(opts.ModifiedCommand))
 	} else {
@@ -239,7 +287,11 @@ func (e *CommandExecutor) Execute(ctx context.Context, opts ExecOptions) protoco
 
 	startErr := cmd.Start()
 	if startErr != nil {
+		restoreTTY()
 		duration := time.Since(opts.StartTime).Milliseconds()
+		if ctx.Err() != nil {
+			return e.cancelledResponse(ctx, opts, stdoutBuf.String(), stderrBuf.String(), duration)
+		}
 		fmt.Fprintf(e.errOut, "Error starting command %s: %s\n",
 			protocol.SanitizeTerminalText(opts.Command),
 			protocol.SanitizeTerminalText(startErr.Error()))
@@ -269,34 +321,7 @@ func (e *CommandExecutor) Execute(ctx context.Context, opts ExecOptions) protoco
 
 	// Check for context cancellation or timeout
 	if ctx.Err() != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			fmt.Fprintf(e.out, "\n⏳ Command execution TIMED OUT (%d ms)\n\n", duration)
-			return protocol.CommandResponse{
-				ID:              opts.ID,
-				Status:          protocol.StatusTimeout,
-				ModifiedCommand: opts.ModifiedCommand,
-				ExitCode:        protocol.ExitCodeTimeout,
-				Stdout:          stdoutBuf.String(),
-				Stderr:          stderrBuf.String(),
-				Error:           "Command execution timed out",
-				DurationMs:      duration,
-			}
-		}
-		cause := context.Cause(ctx)
-		if cause == nil {
-			cause = ctx.Err()
-		}
-		fmt.Fprintf(e.out, "\n🔌 Command execution cancelled (%v)\n\n", cause)
-		return protocol.CommandResponse{
-			ID:              opts.ID,
-			Status:          protocol.StatusRejected,
-			ModifiedCommand: opts.ModifiedCommand,
-			ExitCode:        protocol.ExitCodeRejected,
-			Stdout:          stdoutBuf.String(),
-			Stderr:          stderrBuf.String(),
-			Error:           fmt.Sprintf("Command execution cancelled: %v", cause),
-			DurationMs:      duration,
-		}
+		return e.cancelledResponse(ctx, opts, stdoutBuf.String(), stderrBuf.String(), duration)
 	}
 
 	exitCode := 0

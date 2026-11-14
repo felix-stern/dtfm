@@ -25,6 +25,7 @@ const (
 	defaultIdleReadTimeout = 10 * time.Minute
 	defaultWriteTimeout    = 10 * time.Second
 	defaultExecRespTimeout = 30 * time.Second
+	shutdownWriteGrace     = 50 * time.Millisecond
 )
 
 // countedReader wraps an io.Reader and enforces an upper bound on bytes read per frame,
@@ -102,21 +103,27 @@ func (s *Server) KillActiveChild() {
 // and unblocks idle or active client connections immediately.
 func (s *Server) Shutdown() {
 	s.shutdownOnce.Do(func() {
+		s.connsMu.Lock()
 		s.shutdownCancel(ErrServerShutdown)
+		now := time.Now()
+		for conn := range s.conns {
+			_ = conn.SetDeadline(now)
+		}
+		s.connsMu.Unlock()
+
 		if s.listener != nil {
 			_ = s.listener.Close()
 		}
 		s.KillActiveChild()
-		s.connsMu.Lock()
-		for conn := range s.conns {
-			_ = conn.SetReadDeadline(time.Now())
-		}
-		s.connsMu.Unlock()
 	})
 }
 
 // Serve handles inbound connections concurrently with connection bounding and clean shutdown tracking.
 func (s *Server) Serve() error {
+	if s.listener == nil {
+		s.Shutdown()
+		return errors.New("server listener is nil")
+	}
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
@@ -146,15 +153,53 @@ func (s *Server) Serve() error {
 	}
 }
 
-func writeEnvelope(conn net.Conn, enc *json.Encoder, msgType string, payload any, timeout time.Duration) error {
-	_ = conn.SetWriteDeadline(time.Now().Add(timeout))
-	defer func() { _ = conn.SetWriteDeadline(time.Time{}) }()
-
+func (s *Server) writeEnvelope(conn net.Conn, enc *json.Encoder, msgType string, payload any, timeout time.Duration) error {
 	env, err := protocol.NewEnvelope(msgType, payload)
 	if err != nil {
 		return err
 	}
+
+	s.connsMu.Lock()
+	if s.shutdownCtx != nil && s.shutdownCtx.Err() != nil {
+		// Never overwrite Shutdown()'s deadline with a long write timeout (e.g. 30s).
+		// Skip non-exec responses during shutdown, and cap final exec rejection delivery
+		// to a brief grace bound so Serve() never stalls on backpressured sockets.
+		if msgType != protocol.TypeExecResp {
+			s.connsMu.Unlock()
+			return ErrServerShutdown
+		}
+		if timeout > shutdownWriteGrace {
+			timeout = shutdownWriteGrace
+		}
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(timeout))
+	s.connsMu.Unlock()
+
+	defer func() {
+		s.connsMu.Lock()
+		if s.shutdownCtx == nil || s.shutdownCtx.Err() == nil {
+			_ = conn.SetWriteDeadline(time.Time{})
+		}
+		s.connsMu.Unlock()
+	}()
+
 	return enc.Encode(env)
+}
+
+func isConnCloseOrTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, os.ErrDeadlineExceeded) ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func timeoutResp(id, msg string, start time.Time) protocol.CommandResponse {
@@ -221,11 +266,13 @@ func (s *Server) handleConnection(conn net.Conn) {
 				return
 			}
 			if cr.remaining <= 0 {
-				_ = writeEnvelope(conn, encoder, protocol.TypeError, protocol.ErrorPayload{
+				_ = s.writeEnvelope(conn, encoder, protocol.TypeError, protocol.ErrorPayload{
 					Message: fmt.Sprintf("message exceeds maximum size limit (%d bytes)", protocol.MaxMessageDataBytes),
 				}, defaultWriteTimeout)
-			} else if !errors.Is(err, io.EOF) {
-				fmt.Fprintf(os.Stderr, "Decode error: %v\n", err)
+			} else if !isConnCloseOrTimeoutErr(err) {
+				_ = s.writeEnvelope(conn, encoder, protocol.TypeError, protocol.ErrorPayload{
+					Message: "invalid request envelope",
+				}, defaultWriteTimeout)
 			}
 			return
 		}
@@ -233,19 +280,23 @@ func (s *Server) handleConnection(conn net.Conn) {
 		firstFrame = false
 		receivedAt := time.Now()
 
-		// Clear read deadline while request is being processed
-		_ = conn.SetReadDeadline(time.Time{})
+		s.connsMu.Lock()
+		if s.shutdownCtx.Err() == nil {
+			// Clear read deadline while request is being processed
+			_ = conn.SetReadDeadline(time.Time{})
+		}
+		s.connsMu.Unlock()
 
 		// Enforce maximum payload size to prevent memory exhaustion
 		if len(env.Data) > protocol.MaxMessageDataBytes {
-			_ = writeEnvelope(conn, encoder, protocol.TypeError, protocol.ErrorPayload{
+			_ = s.writeEnvelope(conn, encoder, protocol.TypeError, protocol.ErrorPayload{
 				Message: fmt.Sprintf("request payload exceeded maximum size limit (%d bytes)", protocol.MaxMessageDataBytes),
 			}, defaultWriteTimeout)
 			return
 		}
 
 		if env.Version != protocol.ProtocolVersion {
-			_ = writeEnvelope(conn, encoder, protocol.TypeError, protocol.ErrorPayload{
+			_ = s.writeEnvelope(conn, encoder, protocol.TypeError, protocol.ErrorPayload{
 				Message: fmt.Sprintf("unsupported protocol version: %s (expected %s)", env.Version, protocol.ProtocolVersion),
 			}, defaultWriteTimeout)
 			return
@@ -264,29 +315,31 @@ func (s *Server) handleConnection(conn net.Conn) {
 				Hostname:  hostname,
 				Timestamp: time.Now(),
 			}
-			if err := writeEnvelope(conn, encoder, protocol.TypePingResp, resp, defaultWriteTimeout); err != nil {
+			if err := s.writeEnvelope(conn, encoder, protocol.TypePingResp, resp, defaultWriteTimeout); err != nil {
 				return
 			}
 
 		case protocol.TypeExec:
 			var req protocol.CommandRequest
 			if err := json.Unmarshal(env.Data, &req); err != nil {
-				_ = writeEnvelope(conn, encoder, protocol.TypeError, protocol.ErrorPayload{
+				_ = s.writeEnvelope(conn, encoder, protocol.TypeError, protocol.ErrorPayload{
 					Message: fmt.Sprintf("invalid exec payload: %v", err),
 				}, defaultWriteTimeout)
 				return
 			}
 
 			// Process exec with queue timeout, disconnect watcher, and semaphore
-			resp := s.processExec(conn, br, req, receivedAt)
+			resp, clientDisconnected := s.processExec(conn, br, req, receivedAt)
+			if clientDisconnected {
+				return
+			}
 
-			if err := writeEnvelope(conn, encoder, protocol.TypeExecResp, resp, defaultExecRespTimeout); err != nil {
-				fmt.Fprintf(os.Stderr, "dtfm: failed to send exec response to agent: %v\n", err)
+			if err := s.writeEnvelope(conn, encoder, protocol.TypeExecResp, resp, defaultExecRespTimeout); err != nil {
 				return
 			}
 
 		default:
-			_ = writeEnvelope(conn, encoder, protocol.TypeError, protocol.ErrorPayload{
+			_ = s.writeEnvelope(conn, encoder, protocol.TypeError, protocol.ErrorPayload{
 				Message: fmt.Sprintf("unknown request type: %s", env.Type),
 			}, defaultWriteTimeout)
 			return
@@ -294,8 +347,12 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 }
 
-// isSocketClosed checks if the socket has received a close event (POLLHUP/POLLRDHUP/POLLERR).
+// isSocketClosed checks if the underlying connection has been closed or received peer EOF/error
+// without consuming any bytes from the socket receive queue.
 func isSocketClosed(conn net.Conn) bool {
+	if conn == nil {
+		return true
+	}
 	if dc, ok := conn.(interface{ IsClosedOrEOF() bool }); ok {
 		return dc.IsClosedOrEOF()
 	}
@@ -305,23 +362,64 @@ func isSocketClosed(conn net.Conn) bool {
 	}
 	raw, err := sc.SyscallConn()
 	if err != nil {
-		return false
+		return true
 	}
 	var closed bool
-	_ = raw.Control(func(fd uintptr) {
+	ctrlErr := raw.Control(func(fd uintptr) {
 		pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN | unix.POLLPRI | pollCloseEvents}}
-		n, err := unix.Poll(pfd, 0)
-		if err == nil && n > 0 {
-			if pfd[0].Revents&pollCloseEvents != 0 {
+		var n int
+		var pollErr error
+		for {
+			n, pollErr = unix.Poll(pfd, 0)
+			if !errors.Is(pollErr, syscall.EINTR) {
+				break
+			}
+		}
+		if pollErr != nil {
+			if errors.Is(pollErr, syscall.EBADF) {
+				closed = true
+			}
+			return
+		}
+		if n <= 0 {
+			return
+		}
+		revents := pfd[0].Revents
+		if revents&(pollCloseEvents|unix.POLLNVAL) != 0 {
+			closed = true
+			return
+		}
+		if revents&unix.POLLIN != 0 {
+			var peek [1]byte
+			var rn int
+			var rerr error
+			for {
+				rn, _, rerr = unix.Recvfrom(int(fd), peek[:], unix.MSG_PEEK|unix.MSG_DONTWAIT)
+				if !errors.Is(rerr, syscall.EINTR) {
+					break
+				}
+			}
+			if rn == 0 && rerr == nil {
+				closed = true
+			} else if rn > 0 && rerr == nil && hasQueuedPeerEOF(fd) {
+				closed = true
+			} else if errors.Is(rerr, syscall.ECONNRESET) ||
+				errors.Is(rerr, syscall.EPIPE) ||
+				errors.Is(rerr, syscall.ENOTCONN) ||
+				errors.Is(rerr, syscall.ESHUTDOWN) ||
+				errors.Is(rerr, syscall.EBADF) {
 				closed = true
 			}
 		}
 	})
+	if ctrlErr != nil {
+		return true
+	}
 	return closed
 }
 
-// watchDisconnect monitors a client connection for EOF / closure while operator prompt is active,
-// using Peek so zero bytes are consumed from the stream.
+// watchDisconnect monitors a client connection for EOF or closure while a request
+// is queued, awaiting operator approval, or executing, without consuming bytes from br.
 func watchDisconnect(conn net.Conn, br *bufio.Reader, cancel context.CancelCauseFunc, shutdownCtx context.Context) (stop func(), disconnected <-chan struct{}) {
 	disconnectCh := make(chan struct{})
 	if conn == nil || br == nil {
@@ -331,39 +429,84 @@ func watchDisconnect(conn net.Conn, br *bufio.Reader, cancel context.CancelCause
 	stopCh := make(chan struct{})
 	watcherDone := make(chan struct{})
 
+	var disconnectOnce sync.Once
+	signalDisconnect := func() {
+		if shutdownCtx != nil && shutdownCtx.Err() != nil {
+			return
+		}
+		disconnectOnce.Do(func() {
+			if cancel != nil {
+				cancel(ErrClientDisconnected)
+			}
+			close(disconnectCh)
+		})
+	}
+
+	var deadlineMu sync.Mutex
+	stopped := false
+	_, hasCustomCloseCheck := conn.(interface{ IsClosedOrEOF() bool })
+
 	go func() {
 		defer close(watcherDone)
 		for {
-			if br.Buffered() > 0 {
-				if isSocketClosed(conn) {
-					if shutdownCtx != nil && shutdownCtx.Err() != nil {
-						return
-					}
-					close(disconnectCh)
-					cancel(ErrClientDisconnected)
-					return
-				}
-			}
-
-			_, err := br.Peek(1)
 			select {
 			case <-stopCh:
 				return
 			default:
 			}
-			if err != nil {
-				if shutdownCtx != nil && shutdownCtx.Err() != nil {
-					return
-				}
-				close(disconnectCh)
-				cancel(ErrClientDisconnected)
+			if shutdownCtx != nil && shutdownCtx.Err() != nil {
 				return
 			}
 
+			buffered := br.Buffered()
+			if (buffered > 0 || hasCustomCloseCheck) && isSocketClosed(conn) {
+				signalDisconnect()
+				return
+			}
+
+			if buffered >= br.Size() {
+				if isSocketClosed(conn) {
+					signalDisconnect()
+					return
+				}
+				select {
+				case <-stopCh:
+					return
+				case <-time.After(50 * time.Millisecond):
+				}
+				continue
+			}
+
+			if hasCustomCloseCheck {
+				deadlineMu.Lock()
+				if stopped || (shutdownCtx != nil && shutdownCtx.Err() != nil) {
+					deadlineMu.Unlock()
+					return
+				}
+				_ = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+				deadlineMu.Unlock()
+			}
+
+			// Peek(buffered + 1) compacts unread buffered bytes to index 0 without discarding
+			// any bytes and blocks in conn.Read until at least one new byte or EOF/error arrives.
+			_, err := br.Peek(buffered + 1)
 			select {
 			case <-stopCh:
 				return
-			case <-time.After(50 * time.Millisecond):
+			default:
+			}
+			if shutdownCtx != nil && shutdownCtx.Err() != nil {
+				return
+			}
+			if err != nil {
+				if hasCustomCloseCheck && errors.Is(err, os.ErrDeadlineExceeded) {
+					continue
+				}
+				if errors.Is(err, bufio.ErrBufferFull) {
+					continue
+				}
+				signalDisconnect()
+				return
 			}
 		}
 	}()
@@ -372,29 +515,61 @@ func watchDisconnect(conn net.Conn, br *bufio.Reader, cancel context.CancelCause
 	stop = func() {
 		stopOnce.Do(func() {
 			close(stopCh)
+			deadlineMu.Lock()
+			stopped = true
 			_ = conn.SetReadDeadline(time.Now())
+			deadlineMu.Unlock()
 			<-watcherDone
-			_ = conn.SetReadDeadline(time.Time{})
+			if shutdownCtx == nil || shutdownCtx.Err() == nil {
+				_ = conn.SetReadDeadline(time.Time{})
+			}
 		})
 	}
 
 	return stop, disconnectCh
 }
 
-func (s *Server) processExec(conn net.Conn, br *bufio.Reader, req protocol.CommandRequest, receivedAt time.Time) protocol.CommandResponse {
+func (s *Server) isShuttingDown(ctxs ...context.Context) bool {
+	if s.shutdownCtx != nil && s.shutdownCtx.Err() != nil {
+		return true
+	}
+	for _, ctx := range ctxs {
+		if ctx != nil && errors.Is(context.Cause(ctx), ErrServerShutdown) {
+			return true
+		}
+	}
+	return false
+}
+
+func isClientDisconnected(parentCtx, childCtx context.Context, disconnectCh <-chan struct{}) bool {
+	if parentCtx != nil && errors.Is(context.Cause(parentCtx), ErrClientDisconnected) {
+		return true
+	}
+	if childCtx != nil && errors.Is(context.Cause(childCtx), ErrClientDisconnected) {
+		return true
+	}
+	select {
+	case <-disconnectCh:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) processExec(conn net.Conn, br *bufio.Reader, req protocol.CommandRequest, receivedAt time.Time) (protocol.CommandResponse, bool) {
 	start := time.Now()
 
 	// Validate non-empty command and execution reason upfront
 	if strings.TrimSpace(req.Command) == "" {
-		return rejectResp(req.ID, "Command cannot be empty", start)
+		return rejectResp(req.ID, "Command cannot be empty", start), false
 	}
 	if strings.TrimSpace(req.Reason) == "" {
-		return rejectResp(req.ID, "Execution reason (--why) cannot be empty", start)
+		return rejectResp(req.ID, "Execution reason (--why) cannot be empty", start), false
 	}
 
 	// For security, reject any request attempting to supply custom environment variables
 	if len(req.Env) > 0 {
-		return rejectResp(req.ID, "Custom environment variables are forbidden for security reasons", start)
+		return rejectResp(req.ID, "Custom environment variables are forbidden for security reasons", start), false
 	}
 
 	timeoutSec := req.TimeoutSeconds
@@ -410,7 +585,7 @@ func (s *Server) processExec(conn net.Conn, br *bufio.Reader, req protocol.Comma
 	// protecting against client clock skew and future/past spoofing
 	queueWait := time.Since(receivedAt)
 	if queueWait >= totalTimeout {
-		return timeoutResp(req.ID, "Request timed out in queue before operator review", start)
+		return timeoutResp(req.ID, "Request timed out in queue before operator review", start), false
 	}
 
 	remainingBudget := totalTimeout - queueWait
@@ -429,79 +604,99 @@ func (s *Server) processExec(conn net.Conn, br *bufio.Reader, req protocol.Comma
 	case s.sem <- struct{}{}:
 		defer func() { <-s.sem }()
 	case <-queueCtx.Done():
-		if s.shutdownCtx.Err() != nil || errors.Is(context.Cause(queueCtx), ErrServerShutdown) {
-			return rejectResp(req.ID, "Server is shutting down", start)
+		if s.isShuttingDown(parentCtx, queueCtx) {
+			return rejectResp(req.ID, "Server is shutting down", start), false
 		}
-		return timeoutResp(req.ID, "Request timed out in queue before operator review", start)
+		if isClientDisconnected(parentCtx, queueCtx, disconnectCh) {
+			return rejectResp(req.ID, "Client disconnected while waiting in approval queue", start), true
+		}
+		return timeoutResp(req.ID, "Request timed out in queue before operator review", start), false
 	case <-disconnectCh:
-		if s.shutdownCtx.Err() != nil || errors.Is(context.Cause(queueCtx), ErrServerShutdown) {
-			return rejectResp(req.ID, "Server is shutting down", start)
+		if s.isShuttingDown(parentCtx, queueCtx) {
+			return rejectResp(req.ID, "Server is shutting down", start), false
 		}
-		return rejectResp(req.ID, "Client disconnected while waiting in approval queue", start)
+		return rejectResp(req.ID, "Client disconnected while waiting in approval queue", start), true
 	}
 
-	// Verify server is not shutting down and client is still connected right after acquiring prompt semaphore
-	if s.shutdownCtx.Err() != nil || errors.Is(context.Cause(queueCtx), ErrServerShutdown) {
-		return rejectResp(req.ID, "Server is shutting down", start)
+	// Re-check shutdown, client disconnect, and queue deadline right after acquiring s.sem
+	// (guarding against Go select tie-breaks and cancel-vs-close(disconnectCh) scheduling).
+	if s.isShuttingDown(parentCtx, queueCtx) {
+		return rejectResp(req.ID, "Server is shutting down", start), false
 	}
-	select {
-	case <-disconnectCh:
-		return rejectResp(req.ID, "Client disconnected before operator approval", start)
-	default:
+	if isClientDisconnected(parentCtx, queueCtx, disconnectCh) {
+		return rejectResp(req.ID, "Client disconnected before operator approval", start), true
+	}
+	if queueCtx.Err() != nil {
+		return timeoutResp(req.ID, "Request timed out in queue before operator review", start), false
+	}
+	if s.prompter == nil {
+		return rejectResp(req.ID, "Approval prompter is not configured", start), false
 	}
 
 	// Prompt runs synchronously under s.sem, cancellable by queueCtx
 	decision, edited, reason, err := s.prompter.Prompt(queueCtx, req)
 
 	if err != nil {
-		if s.shutdownCtx.Err() != nil || errors.Is(err, ErrServerShutdown) || errors.Is(context.Cause(queueCtx), ErrServerShutdown) {
-			return rejectResp(req.ID, "Server is shutting down", start)
+		if s.isShuttingDown(parentCtx, queueCtx) || errors.Is(err, ErrServerShutdown) {
+			return rejectResp(req.ID, "Server is shutting down", start), false
 		}
-
-		select {
-		case <-disconnectCh:
-			return rejectResp(req.ID, "Client disconnected before operator approval", start)
-		default:
+		if isClientDisconnected(parentCtx, queueCtx, disconnectCh) || errors.Is(err, ErrClientDisconnected) {
+			return rejectResp(req.ID, "Client disconnected before operator approval", start), true
 		}
-
-		if errors.Is(err, ErrClientDisconnected) || errors.Is(context.Cause(queueCtx), ErrClientDisconnected) {
-			return rejectResp(req.ID, "Client disconnected before operator approval", start)
-		}
-
-		if queueCtx.Err() != nil || decision == DecisionTimeout {
-			return timeoutResp(req.ID, "Timed out waiting for operator approval", start)
+		if queueCtx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || decision == DecisionTimeout {
+			return timeoutResp(req.ID, "Timed out waiting for operator approval", start), false
 		}
 		if reason == "" {
 			reason = "Declined by operator"
 		}
-		return rejectResp(req.ID, reason, start)
+		return rejectResp(req.ID, reason, start), false
 	}
 
-	// Double-check shutdown and client connectivity before running approved command
-	if s.shutdownCtx.Err() != nil || errors.Is(context.Cause(queueCtx), ErrServerShutdown) {
-		return rejectResp(req.ID, "Server is shutting down", start)
+	// Re-check shutdown, client disconnect, explicit rejection, and queue deadline before execution
+	if s.isShuttingDown(parentCtx, queueCtx) {
+		return rejectResp(req.ID, "Server is shutting down", start), false
 	}
-	select {
-	case <-disconnectCh:
-		return rejectResp(req.ID, "Client disconnected before operator approval", start)
-	default:
+	if isClientDisconnected(parentCtx, queueCtx, disconnectCh) {
+		return rejectResp(req.ID, "Client disconnected before operator approval", start), true
 	}
-
 	if decision == DecisionReject {
 		if reason == "" {
 			reason = "Declined by operator"
 		}
-		return rejectResp(req.ID, reason, start)
+		return rejectResp(req.ID, reason, start), false
+	}
+	if decision == DecisionTimeout || queueCtx.Err() != nil {
+		return timeoutResp(req.ID, "Timed out waiting for operator approval", start), false
+	}
+	if s.executor == nil {
+		return rejectResp(req.ID, "Command executor is not configured", start), false
 	}
 
-	// Dedicated execution context budget: operator deliberation does not truncate command runtime.
-	// Derived from parentCtx so client disconnect or server shutdown cancels command execution immediately.
-	execCtx, execCancel := context.WithTimeout(parentCtx, totalTimeout)
-	defer execCancel()
+	var resp protocol.CommandResponse
+	switch decision {
+	case DecisionApprove:
+		// Dedicated execution context budget: operator deliberation does not truncate command runtime.
+		// Derived from parentCtx so client disconnect or server shutdown cancels command execution immediately.
+		execCtx, execCancel := context.WithTimeout(parentCtx, totalTimeout)
+		defer execCancel()
+		resp = s.executor.Execute(execCtx, ExecOptions{
+			ID:              req.ID,
+			Command:         req.Command,
+			Args:            req.Args,
+			Cwd:             req.Cwd,
+			ModifiedCommand: "",
+			StartTime:       start,
+		})
 
-	if decision == DecisionEdit {
+	case DecisionEdit:
+		edited = strings.TrimSpace(edited)
+		if edited == "" {
+			return rejectResp(req.ID, "Edited command cannot be empty", start), false
+		}
+		execCtx, execCancel := context.WithTimeout(parentCtx, totalTimeout)
+		defer execCancel()
 		if edited == protocol.FormatCommand(req.Command, req.Args) {
-			return s.executor.Execute(execCtx, ExecOptions{
+			resp = s.executor.Execute(execCtx, ExecOptions{
 				ID:              req.ID,
 				Command:         req.Command,
 				Args:            req.Args,
@@ -509,16 +704,28 @@ func (s *Server) processExec(conn net.Conn, br *bufio.Reader, req protocol.Comma
 				ModifiedCommand: "",
 				StartTime:       start,
 			})
+		} else {
+			resp = s.executor.ExecuteShell(execCtx, req.ID, edited, req.Cwd, start)
 		}
-		return s.executor.ExecuteShell(execCtx, req.ID, edited, req.Cwd, start)
+
+	default:
+		if reason == "" {
+			reason = "Declined by operator"
+		}
+		return rejectResp(req.ID, reason, start), false
 	}
 
-	return s.executor.Execute(execCtx, ExecOptions{
-		ID:              req.ID,
-		Command:         req.Command,
-		Args:            req.Args,
-		Cwd:             req.Cwd,
-		ModifiedCommand: "",
-		StartTime:       start,
-	})
+	if s.isShuttingDown(parentCtx) {
+		if resp.Status == protocol.StatusRejected && resp.RejectReason == "" {
+			resp.RejectReason = "Server is shutting down"
+		}
+		return resp, false
+	}
+	if isClientDisconnected(parentCtx, nil, disconnectCh) {
+		if resp.Status == protocol.StatusRejected && resp.RejectReason == "" {
+			resp.RejectReason = "Client disconnected during command execution"
+		}
+		return resp, true
+	}
+	return resp, false
 }

@@ -82,6 +82,24 @@ func shortTempSockDir(t *testing.T) string {
 	return dir
 }
 
+func startTestServer(t *testing.T, server *Server) <-chan struct{} {
+	t.Helper()
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		_ = server.Serve()
+	}()
+	t.Cleanup(func() {
+		server.Shutdown()
+		select {
+		case <-serveDone:
+		case <-time.After(3 * time.Second):
+			t.Errorf("server.Serve() did not exit within 3s after Shutdown()")
+		}
+	})
+	return serveDone
+}
+
 func TestServerPingAndExecFlow(t *testing.T) {
 	tmpDir := shortTempSockDir(t)
 	sockPath := filepath.Join(tmpDir, "s.sock")
@@ -96,8 +114,8 @@ func TestServerPingAndExecFlow(t *testing.T) {
 		decision: DecisionApprove,
 	}
 
-	server := NewServer(listener, prompter)
-	go server.Serve()
+	server := NewServerWithExecutor(listener, prompter, NewCommandExecutor(io.Discard, io.Discard))
+	startTestServer(t, server)
 
 	conn, err := net.Dial("unix", sockPath)
 	if err != nil {
@@ -192,8 +210,8 @@ func TestServerDeadStdinSecurityRepro(t *testing.T) {
 	streamPrompter := NewStreamPrompter(strings.NewReader(""), new(bytes.Buffer))
 	defer streamPrompter.Close()
 
-	server := NewServer(listener, streamPrompter)
-	go server.Serve()
+	server := NewServerWithExecutor(listener, streamPrompter, NewCommandExecutor(io.Discard, io.Discard))
+	startTestServer(t, server)
 
 	conn, err := net.Dial("unix", sockPath)
 	if err != nil {
@@ -251,8 +269,8 @@ func TestServerConcurrentPingDuringApproval(t *testing.T) {
 		called:   called,
 	}
 
-	server := NewServer(listener, prompter)
-	go server.Serve()
+	server := NewServerWithExecutor(listener, prompter, NewCommandExecutor(io.Discard, io.Discard))
+	serveDone := startTestServer(t, server)
 
 	// Client 1 sends exec
 	conn1, err := net.Dial("unix", sockPath)
@@ -298,6 +316,9 @@ func TestServerConcurrentPingDuringApproval(t *testing.T) {
 	if pingRespEnv.Type != protocol.TypePingResp {
 		t.Errorf("Expected ping_resp, got %s", pingRespEnv.Type)
 	}
+
+	server.Shutdown()
+	<-serveDone
 }
 
 func TestServerExecTimeout(t *testing.T) {
@@ -315,8 +336,8 @@ func TestServerExecTimeout(t *testing.T) {
 		delay:    2 * time.Second,
 	}
 
-	server := NewServer(listener, prompter)
-	go server.Serve()
+	server := NewServerWithExecutor(listener, prompter, NewCommandExecutor(io.Discard, io.Discard))
+	startTestServer(t, server)
 
 	conn, err := net.Dial("unix", sockPath)
 	if err != nil {
@@ -370,8 +391,8 @@ func TestQueuedRequestExpiredBeforeReview(t *testing.T) {
 		decision: DecisionApprove,
 	}
 
-	server := NewServer(listener, prompter)
-	go server.Serve()
+	server := NewServerWithExecutor(listener, prompter, NewCommandExecutor(io.Discard, io.Discard))
+	serveDone := startTestServer(t, server)
 
 	// 1. Send Request 1 (holds s.mu for 1.1s)
 	conn1, err := net.Dial("unix", sockPath)
@@ -421,6 +442,9 @@ func TestQueuedRequestExpiredBeforeReview(t *testing.T) {
 	if !strings.Contains(resp.Error, "timed out in queue") {
 		t.Errorf("Expected 'timed out in queue' error, got: %s", resp.Error)
 	}
+
+	server.Shutdown()
+	<-serveDone
 }
 
 func TestSubprocessGrandchildTimeoutGroupKill(t *testing.T) {
@@ -535,8 +559,8 @@ func TestServerClientDisconnectDuringPrompt(t *testing.T) {
 			return DecisionReject, "", "Unknown request", nil
 		},
 	}
-	server := NewServer(listener, prompter)
-	go server.Serve()
+	server := NewServerWithExecutor(listener, prompter, NewCommandExecutor(io.Discard, io.Discard))
+	startTestServer(t, server)
 
 	conn, err := net.Dial("unix", sockPath)
 	if err != nil {
@@ -622,8 +646,8 @@ func TestServerRejectsCustomEnvRequest(t *testing.T) {
 	defer listener.Close()
 
 	prompter := &mockPrompter{decision: DecisionApprove}
-	server := NewServer(listener, prompter)
-	go server.Serve()
+	server := NewServerWithExecutor(listener, prompter, NewCommandExecutor(io.Discard, io.Discard))
+	startTestServer(t, server)
 
 	conn, err := net.Dial("unix", sockPath)
 	if err != nil {
@@ -673,8 +697,8 @@ func TestServerRejectsEmptyCommandAndReason(t *testing.T) {
 	defer listener.Close()
 
 	prompter := &mockPrompter{decision: DecisionApprove}
-	server := NewServer(listener, prompter)
-	go server.Serve()
+	server := NewServerWithExecutor(listener, prompter, NewCommandExecutor(io.Discard, io.Discard))
+	startTestServer(t, server)
 
 	conn, err := net.Dial("unix", sockPath)
 	if err != nil {
@@ -735,8 +759,8 @@ func TestServerQueuedRequestTimesOutWhileWaiting(t *testing.T) {
 		delay:    1200 * time.Millisecond,
 		called:   called,
 	}
-	server := NewServer(listener, prompter)
-	go server.Serve()
+	server := NewServerWithExecutor(listener, prompter, NewCommandExecutor(io.Discard, io.Discard))
+	serveDone := startTestServer(t, server)
 
 	// Client 1 sends exec holding the prompt
 	conn1, err := net.Dial("unix", sockPath)
@@ -789,6 +813,9 @@ func TestServerQueuedRequestTimesOutWhileWaiting(t *testing.T) {
 	if dur2 > 1500*time.Millisecond {
 		t.Errorf("Queued request took too long to time out: %v (expected ~1s)", dur2)
 	}
+
+	server.Shutdown()
+	<-serveDone
 }
 
 func TestServerQueuedClientDisconnectBeforeTurn(t *testing.T) {
@@ -801,27 +828,29 @@ func TestServerQueuedClientDisconnectBeforeTurn(t *testing.T) {
 	}
 	defer listener.Close()
 
-	promptCount := 0
-	var promptMu sync.Mutex
+	var promptCount atomic.Int32
 	called := make(chan struct{}, 1)
+	releaseReq1 := make(chan struct{})
 	prompter := &mockPrompter{
 		onPrompt: func(ctx context.Context, req protocol.CommandRequest) (ApprovalDecision, string, string, error) {
-			promptMu.Lock()
-			promptCount++
-			promptMu.Unlock()
+			promptCount.Add(1)
 			select {
 			case called <- struct{}{}:
 			default:
 			}
 			if req.ID == "req-1" {
-				time.Sleep(300 * time.Millisecond)
-				return DecisionApprove, "", "", nil
+				select {
+				case <-releaseReq1:
+					return DecisionApprove, "", "", nil
+				case <-ctx.Done():
+					return DecisionReject, "", "cancelled", context.Cause(ctx)
+				}
 			}
 			return DecisionApprove, "", "", nil
 		},
 	}
-	server := NewServer(listener, prompter)
-	go server.Serve()
+	server := NewServerWithExecutor(listener, prompter, NewCommandExecutor(io.Discard, io.Discard))
+	serveDone := startTestServer(t, server)
 
 	conn1, err := net.Dial("unix", sockPath)
 	if err != nil {
@@ -840,7 +869,45 @@ func TestServerQueuedClientDisconnectBeforeTurn(t *testing.T) {
 
 	<-called
 
-	// Client 2 connects and queues
+	// 1. Verify processExec classifies queued client disconnect as StatusRejected (126),
+	// NOT StatusTimeout (124), and unblocks immediately while req-1 still holds s.sem.
+	pipeSrv, pipeCli := net.Pipe()
+	defer pipeSrv.Close()
+	type execResult struct {
+		resp         protocol.CommandResponse
+		disconnected bool
+	}
+	resCh := make(chan execResult, 1)
+	go func() {
+		resp, disconnected := server.processExec(pipeSrv, bufio.NewReader(pipeSrv), protocol.CommandRequest{
+			ID:             "req-queued-direct",
+			Reason:         "Queued direct check",
+			Command:        "touch",
+			Args:           []string{"PWNED"},
+			TimeoutSeconds: 30,
+		}, time.Now())
+		resCh <- execResult{resp: resp, disconnected: disconnected}
+	}()
+	time.Sleep(25 * time.Millisecond)
+	_ = pipeCli.Close()
+
+	select {
+	case res := <-resCh:
+		if !res.disconnected {
+			t.Fatalf("Expected processExec to report clientDisconnected=true on queued disconnect")
+		}
+		if res.resp.Status != protocol.StatusRejected || res.resp.ExitCode != protocol.ExitCodeRejected {
+			t.Fatalf("Expected StatusRejected (126) for queued client disconnect, got status=%s exit=%d (err=%q reason=%q)",
+				res.resp.Status, res.resp.ExitCode, res.resp.Error, res.resp.RejectReason)
+		}
+		if !strings.Contains(res.resp.RejectReason, "waiting in approval queue") {
+			t.Errorf("Expected 'waiting in approval queue' RejectReason, got %q", res.resp.RejectReason)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("processExec did not unblock within 500ms when queued client disconnected")
+	}
+
+	// 2. End-to-end socket client queues behind req-1 and disconnects before its turn.
 	conn2, err := net.Dial("unix", sockPath)
 	if err != nil {
 		t.Fatalf("Dial conn2 failed: %v", err)
@@ -855,23 +922,22 @@ func TestServerQueuedClientDisconnectBeforeTurn(t *testing.T) {
 	env2, _ := protocol.NewEnvelope(protocol.TypeExec, req2)
 	_ = json.NewEncoder(conn2).Encode(env2)
 
-	// Client 2 closes connection while queued!
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(40 * time.Millisecond)
 	_ = conn2.Close()
 
-	// Wait for Request 1 response
+	// Release req-1 and read its response
+	close(releaseReq1)
 	var respEnv1 protocol.Envelope
-	_ = json.NewDecoder(conn1).Decode(&respEnv1)
+	if err := json.NewDecoder(conn1).Decode(&respEnv1); err != nil {
+		t.Fatalf("Decode req1 failed: %v", err)
+	}
 
-	// Wait briefly for Server to process req2's turn
-	time.Sleep(100 * time.Millisecond)
+	_ = conn1.Close()
+	server.Shutdown()
+	<-serveDone
 
-	promptMu.Lock()
-	count := promptCount
-	promptMu.Unlock()
-
-	if count > 1 {
-		t.Fatalf("Prompter was called %d times; disconnected queued request should NOT have prompted!", count)
+	if count := promptCount.Load(); count != 1 {
+		t.Fatalf("Prompter was called %d times; disconnected queued requests must NOT prompt!", count)
 	}
 }
 
@@ -886,8 +952,8 @@ func TestServerOversizedMessageTypeError(t *testing.T) {
 	defer listener.Close()
 
 	prompter := &mockPrompter{decision: DecisionApprove}
-	server := NewServer(listener, prompter)
-	go server.Serve()
+	server := NewServerWithExecutor(listener, prompter, NewCommandExecutor(io.Discard, io.Discard))
+	startTestServer(t, server)
 
 	conn, err := net.Dial("unix", sockPath)
 	if err != nil {
@@ -1149,9 +1215,8 @@ func TestServerEnvRejectNoOutputBeforeSemaphore(t *testing.T) {
 
 	var outBuf syncBuffer
 	prompter := &mockPrompter{decision: DecisionApprove}
-	server := NewServer(listener, prompter)
-	server.executor = NewCommandExecutor(&outBuf, &outBuf)
-	go server.Serve()
+	server := NewServerWithExecutor(listener, prompter, NewCommandExecutor(&outBuf, &outBuf))
+	startTestServer(t, server)
 
 	conn, err := net.Dial("unix", sockPath)
 	if err != nil {
@@ -1200,9 +1265,8 @@ func TestServerUnchangedEditDirectExecution(t *testing.T) {
 		decision:  DecisionEdit,
 		editedCmd: unchangedCmd,
 	}
-	server := NewServer(listener, prompter)
-	server.executor = NewCommandExecutor(&outBuf, &outBuf)
-	go server.Serve()
+	server := NewServerWithExecutor(listener, prompter, NewCommandExecutor(&outBuf, &outBuf))
+	startTestServer(t, server)
 
 	conn, err := net.Dial("unix", sockPath)
 	if err != nil {
@@ -1294,10 +1358,12 @@ func TestWatchDisconnectRelayConnFailClosedWithBufferedData(t *testing.T) {
 
 type failWriteConn struct {
 	net.Conn
+	writes atomic.Int32
 	closed atomic.Bool
 }
 
 func (c *failWriteConn) Write(p []byte) (n int, err error) {
+	c.writes.Add(1)
 	return 0, errors.New("simulated write failure")
 }
 
@@ -1307,36 +1373,993 @@ func (c *failWriteConn) Close() error {
 }
 
 func TestServerWriteEnvelopeErrorImmediateDisconnect(t *testing.T) {
-	c1, c2 := net.Pipe()
-	defer c2.Close()
+	t.Run("ping", func(t *testing.T) {
+		c1, c2 := net.Pipe()
+		defer c2.Close()
 
-	fwc := &failWriteConn{Conn: c1}
-	defer fwc.Close()
+		fwc := &failWriteConn{Conn: c1}
+		defer fwc.Close()
 
-	s := NewServer(nil, nil)
+		s := NewServerWithExecutor(nil, nil, NewCommandExecutor(io.Discard, io.Discard))
 
-	go func() {
-		enc := json.NewEncoder(c2)
-		_ = enc.Encode(protocol.Envelope{
-			Type: protocol.TypePing,
-			Data: []byte(`{"id":"test-ping-fail-write"}`),
-		})
-	}()
+		go func() {
+			env, err := protocol.NewEnvelope(protocol.TypePing, protocol.PingRequest{
+				ID:        "test-ping-fail-write",
+				Timestamp: time.Now(),
+			})
+			if err == nil {
+				_ = json.NewEncoder(c2).Encode(env)
+			}
+		}()
 
-	done := make(chan struct{})
-	go func() {
-		s.handleConnection(fwc)
-		close(done)
-	}()
+		done := make(chan struct{})
+		go func() {
+			s.handleConnection(fwc)
+			close(done)
+		}()
 
-	select {
-	case <-done:
-		// Success: handleConnection exited immediately upon writeEnvelope failure
-	case <-time.After(time.Second):
-		t.Fatal("handleConnection blocked instead of immediately returning on writeEnvelope error")
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("handleConnection blocked instead of immediately returning on ping writeEnvelope error")
+		}
+
+		if fwc.writes.Load() != 1 {
+			t.Fatalf("expected exactly 1 write attempt on TypePing response, got %d", fwc.writes.Load())
+		}
+		if !fwc.closed.Load() {
+			t.Fatal("expected conn.Close() to run immediately on writeEnvelope failure")
+		}
+	})
+
+	t.Run("exec", func(t *testing.T) {
+		c1, c2 := net.Pipe()
+		defer c2.Close()
+
+		fwc := &failWriteConn{Conn: c1}
+		defer fwc.Close()
+
+		prompted := atomic.Bool{}
+		prompter := &mockPrompter{
+			onPrompt: func(ctx context.Context, req protocol.CommandRequest) (ApprovalDecision, string, string, error) {
+				prompted.Store(true)
+				return DecisionApprove, "", "", nil
+			},
+		}
+		s := NewServerWithExecutor(nil, prompter, NewCommandExecutor(io.Discard, io.Discard))
+
+		go func() {
+			env, err := protocol.NewEnvelope(protocol.TypeExec, protocol.CommandRequest{
+				ID:             "test-exec-fail-write",
+				Command:        "true",
+				Reason:         "test write failure on exec_resp",
+				TimeoutSeconds: 5,
+			})
+			if err == nil {
+				_ = json.NewEncoder(c2).Encode(env)
+			}
+		}()
+
+		done := make(chan struct{})
+		go func() {
+			s.handleConnection(fwc)
+			close(done)
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("handleConnection blocked instead of immediately returning on exec writeEnvelope error")
+		}
+
+		if !prompted.Load() {
+			t.Fatal("expected request to reach TypeExec prompter with valid ProtocolVersion")
+		}
+		if fwc.writes.Load() != 1 {
+			t.Fatalf("expected exactly 1 write attempt on TypeExec response, got %d", fwc.writes.Load())
+		}
+		if !fwc.closed.Load() {
+			t.Fatal("expected conn.Close() to run immediately on writeEnvelope failure")
+		}
+	})
+}
+
+func TestIsSocketClosedAdversarial(t *testing.T) {
+	if !isSocketClosed(nil) {
+		t.Fatal("expected isSocketClosed(nil) to fail closed (true)")
 	}
 
-	if !fwc.closed.Load() {
-		t.Fatal("expected conn.Close() to run immediately on writeEnvelope failure")
+	tmpDir := shortTempSockDir(t)
+	sockPath := filepath.Join(tmpDir, "s.sock")
+
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+	defer listener.Close()
+
+	// 1. Active open UnixConn -> false, then peer CloseWrite() half-close -> true
+	acceptCh := make(chan net.Conn, 2)
+	go func() {
+		for i := 0; i < 2; i++ {
+			c, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			acceptCh <- c
+		}
+	}()
+
+	cli1, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatalf("Dial 1 failed: %v", err)
+	}
+	defer cli1.Close()
+	srv1 := <-acceptCh
+	defer srv1.Close()
+
+	if isSocketClosed(srv1) {
+		t.Fatal("expected open UnixConn to report isSocketClosed == false")
+	}
+
+	if err := cli1.(*net.UnixConn).CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite failed: %v", err)
+	}
+
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for !isSocketClosed(srv1) && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !isSocketClosed(srv1) {
+		t.Fatal("expected isSocketClosed(srv1) == true after peer CloseWrite() half-close")
+	}
+
+	// 2. Locally closed UnixConn -> must fail closed (true)
+	cli2, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatalf("Dial 2 failed: %v", err)
+	}
+	defer cli2.Close()
+	srv2 := <-acceptCh
+	_ = srv2.Close()
+
+	if !isSocketClosed(srv2) {
+		t.Fatal("expected locally closed UnixConn to fail closed (isSocketClosed == true)")
+	}
+}
+
+func TestWatchDisconnectBufferedDataOnNetPipe(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	const payload = "pipelined unconsumed trailing data\n"
+	writeDone := make(chan struct{})
+	go func() {
+		_, _ = c2.Write([]byte(payload))
+		close(writeDone)
+	}()
+
+	br := bufio.NewReader(c1)
+	if _, err := br.Peek(10); err != nil {
+		t.Fatalf("Peek failed: %v", err)
+	}
+	<-writeDone
+	if br.Buffered() == 0 || br.Buffered() >= br.Size() {
+		t.Fatalf("expected 0 < br.Buffered() < br.Size(), got %d", br.Buffered())
+	}
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	stop, disconnected := watchDisconnect(c1, br, cancel, context.Background())
+	defer stop()
+
+	// Close remote end of net.Pipe (which does NOT implement syscall.Conn or IsClosedOrEOF)
+	_ = c2.Close()
+
+	select {
+	case <-disconnected:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("watchDisconnect failed to detect net.Pipe EOF when br.Buffered() > 0")
+	}
+
+	if !errors.Is(context.Cause(ctx), ErrClientDisconnected) {
+		t.Fatalf("expected context cause ErrClientDisconnected immediately after <-disconnected, got %v", context.Cause(ctx))
+	}
+
+	// Verify zero buffered bytes were lost or corrupted
+	stop()
+	got, err := io.ReadAll(br)
+	if err != nil {
+		t.Fatalf("ReadAll buffered data failed: %v", err)
+	}
+	if string(got) != payload {
+		t.Fatalf("buffered stream corrupted: got %q, want %q", string(got), payload)
+	}
+}
+
+func TestWatchDisconnectRelayConnFailClosedZeroBuffered(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	rc := &mockRelayConn{Conn: c1}
+	br := bufio.NewReader(rc)
+	if br.Buffered() != 0 {
+		t.Fatalf("expected br.Buffered() == 0, got %d", br.Buffered())
+	}
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	stop, disconnected := watchDisconnect(rc, br, cancel, context.Background())
+	defer stop()
+
+	// Let watchDisconnect enter its first Peek iteration with br.Buffered() == 0,
+	// then flip IsClosedOrEOF() without closing the underlying net.Pipe.
+	time.Sleep(15 * time.Millisecond)
+	rc.closed.Store(true)
+
+	select {
+	case <-disconnected:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("watchDisconnect spun without detecting IsClosedOrEOF() when br.Buffered() == 0")
+	}
+
+	if !errors.Is(context.Cause(ctx), ErrClientDisconnected) {
+		t.Fatalf("expected ErrClientDisconnected, got: %v", context.Cause(ctx))
+	}
+}
+
+func TestWatchDisconnectFullBufferUnixConn(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		halfClose        bool
+		extraKernelBytes int
+	}{
+		{name: "full_close", halfClose: false, extraKernelBytes: 0},
+		{name: "half_close_write", halfClose: true, extraKernelBytes: 0},
+		{name: "half_close_with_unread_kernel_bytes", halfClose: true, extraKernelBytes: 1024},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := shortTempSockDir(t)
+			sockPath := filepath.Join(tmpDir, "s.sock")
+
+			listener, err := net.Listen("unix", sockPath)
+			if err != nil {
+				t.Fatalf("Listen failed: %v", err)
+			}
+			defer listener.Close()
+
+			acceptCh := make(chan net.Conn, 1)
+			go func() {
+				c, err := listener.Accept()
+				if err == nil {
+					acceptCh <- c
+				}
+			}()
+
+			cli, err := net.Dial("unix", sockPath)
+			if err != nil {
+				t.Fatalf("Dial failed: %v", err)
+			}
+			defer cli.Close()
+			srv := <-acceptCh
+			defer srv.Close()
+
+			const bufSize = 64
+			br := bufio.NewReaderSize(srv, bufSize)
+			expected := strings.Repeat("X", bufSize+tc.extraKernelBytes)
+			if _, err := cli.Write([]byte(expected)); err != nil {
+				t.Fatalf("Write failed: %v", err)
+			}
+			if _, err := br.Peek(bufSize); err != nil {
+				t.Fatalf("Peek(bufSize) failed: %v", err)
+			}
+			if br.Buffered() != br.Size() {
+				t.Fatalf("expected full buffer (%d == %d), got %d", br.Buffered(), br.Size(), br.Buffered())
+			}
+
+			ctx, cancel := context.WithCancelCause(context.Background())
+			stop, disconnected := watchDisconnect(srv, br, cancel, context.Background())
+			defer stop()
+
+			if tc.halfClose {
+				_ = cli.(*net.UnixConn).CloseWrite()
+			} else {
+				_ = cli.Close()
+			}
+
+			select {
+			case <-disconnected:
+			case <-time.After(500 * time.Millisecond):
+				t.Fatalf("watchDisconnect failed to detect %s when bufio.Reader buffer was full", tc.name)
+			}
+
+			if !errors.Is(context.Cause(ctx), ErrClientDisconnected) {
+				t.Fatalf("expected ErrClientDisconnected, got %v", context.Cause(ctx))
+			}
+
+			stop()
+			rest := make([]byte, len(expected))
+			if _, err := io.ReadFull(br, rest); err != nil {
+				t.Fatalf("ReadFull buffered+kernel bytes failed: %v", err)
+			}
+			if string(rest) != expected {
+				t.Fatalf("stream bytes corrupted: len=%d, want len=%d", len(rest), len(expected))
+			}
+		})
+	}
+}
+
+func TestWatchDisconnectNilCancelAndIdempotentStop(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+
+	stop, disconnected := watchDisconnect(c1, bufio.NewReader(c1), nil, nil)
+	_ = c2.Close()
+
+	select {
+	case <-disconnected:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("watchDisconnect with nil cancel did not close disconnected channel")
+	}
+
+	// Multiple stop() calls must be safe and non-panicking
+	stop()
+	stop()
+}
+
+func TestServerProcessExecFailClosedDecisions(t *testing.T) {
+	cases := []struct {
+		name     string
+		prompter Prompter
+	}{
+		{
+			name: "empty_decision_zero_value",
+			prompter: &mockPrompter{
+				decision: "",
+			},
+		},
+		{
+			name: "unknown_decision_string",
+			prompter: &mockPrompter{
+				decision: ApprovalDecision("auto-approve-bug"),
+			},
+		},
+		{
+			name: "whitespace_only_edit",
+			prompter: &mockPrompter{
+				decision:  DecisionEdit,
+				editedCmd: "   \t\n  ",
+			},
+		},
+		{
+			name:     "nil_prompter",
+			prompter: nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var outBuf syncBuffer
+			s := NewServerWithExecutor(nil, tc.prompter, NewCommandExecutor(&outBuf, &outBuf))
+			c1, c2 := net.Pipe()
+			defer c1.Close()
+			defer c2.Close()
+
+			resp, disconnected := s.processExec(c1, bufio.NewReader(c1), protocol.CommandRequest{
+				ID:             "fail-closed-" + tc.name,
+				Command:        "echo",
+				Args:           []string{"MUST_NOT_EXECUTE"},
+				Reason:         "adversarial decision test",
+				TimeoutSeconds: 5,
+			}, time.Now())
+
+			if disconnected {
+				t.Fatalf("expected disconnected=false, got true")
+			}
+			if resp.Status != protocol.StatusRejected || resp.ExitCode != protocol.ExitCodeRejected {
+				t.Fatalf("SECURITY FAILURE (%s): expected StatusRejected (126), got status=%s exit=%d",
+					tc.name, resp.Status, resp.ExitCode)
+			}
+			if strings.TrimSpace(resp.RejectReason) == "" {
+				t.Errorf("expected non-empty RejectReason for %s", tc.name)
+			}
+			if strings.Contains(outBuf.String(), "MUST_NOT_EXECUTE") {
+				t.Fatalf("SECURITY FAILURE (%s): command executed despite invalid approval state: %q", tc.name, outBuf.String())
+			}
+		})
+	}
+}
+
+func TestServerClientDisconnectDuringActiveExecute(t *testing.T) {
+	// 1. Direct executor check: pre-cancelled context before cmd.Start() must NOT return StatusError (127),
+	// and must populate RejectReason according to cancellation cause.
+	t.Run("cancelled_before_start", func(t *testing.T) {
+		executor := NewCommandExecutor(io.Discard, io.Discard)
+
+		for _, tc := range []struct {
+			cause      error
+			wantReason string
+		}{
+			{ErrServerShutdown, "Server is shutting down"},
+			{ErrClientDisconnected, "Client disconnected during command execution"},
+		} {
+			ctx, cancel := context.WithCancelCause(context.Background())
+			cancel(tc.cause)
+			resp := executor.Execute(ctx, ExecOptions{
+				ID:        "pre-cancel",
+				Command:   "sleep",
+				Args:      []string{"5"},
+				StartTime: time.Now(),
+			})
+			if resp.Status != protocol.StatusRejected || resp.ExitCode != protocol.ExitCodeRejected {
+				t.Fatalf("cause=%v: expected StatusRejected (126), got status=%s exit=%d", tc.cause, resp.Status, resp.ExitCode)
+			}
+			if resp.RejectReason != tc.wantReason {
+				t.Fatalf("cause=%v: expected RejectReason %q, got %q", tc.cause, tc.wantReason, resp.RejectReason)
+			}
+		}
+	})
+
+	// 2. End-to-end disconnect during active Execute kills running child, skips response write, and releases s.sem.
+	t.Run("active_child_killed_and_sem_released", func(t *testing.T) {
+		tmpDir := shortTempSockDir(t)
+		sockPath := filepath.Join(tmpDir, "s.sock")
+
+		listener, err := net.Listen("unix", sockPath)
+		if err != nil {
+			t.Fatalf("Listen failed: %v", err)
+		}
+		defer listener.Close()
+
+		executor := NewCommandExecutor(io.Discard, io.Discard)
+		prompter := &mockPrompter{decision: DecisionApprove}
+		server := NewServerWithExecutor(listener, prompter, executor)
+		startTestServer(t, server)
+
+		// Also verify processExec response fields directly over net.Pipe
+		pipeSrv, pipeCli := net.Pipe()
+		defer pipeSrv.Close()
+		type execResult struct {
+			resp         protocol.CommandResponse
+			disconnected bool
+		}
+		directResCh := make(chan execResult, 1)
+		go func() {
+			resp, disconnected := server.processExec(pipeSrv, bufio.NewReader(pipeSrv), protocol.CommandRequest{
+				ID:             "exec-disconnect-direct",
+				Command:        "sleep",
+				Args:           []string{"30"},
+				Reason:         "test disconnect during execute",
+				TimeoutSeconds: 30,
+			}, time.Now())
+			directResCh <- execResult{resp: resp, disconnected: disconnected}
+		}()
+
+		var pid int
+		for i := 0; i < 100; i++ {
+			pid = executor.ActiveChildPid()
+			if pid > 0 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if pid <= 0 {
+			t.Fatal("timed out waiting for child process to start")
+		}
+
+		// Disconnect client while sleep 30 is actively running
+		_ = pipeCli.Close()
+
+		select {
+		case res := <-directResCh:
+			if !res.disconnected {
+				t.Fatal("expected clientDisconnected=true when client disconnected during Execute")
+			}
+			if res.resp.Status != protocol.StatusRejected || res.resp.ExitCode != protocol.ExitCodeRejected {
+				t.Fatalf("expected StatusRejected (126), got status=%s exit=%d", res.resp.Status, res.resp.ExitCode)
+			}
+			if res.resp.RejectReason != "Client disconnected during command execution" {
+				t.Fatalf("expected RejectReason 'Client disconnected during command execution', got %q", res.resp.RejectReason)
+			}
+		case <-time.After(1 * time.Second):
+			t.Fatal("processExec did not abort promptly when client disconnected during Execute")
+		}
+
+		// Subsequent socket client must immediately acquire s.sem and execute cleanly
+		conn, err := net.Dial("unix", sockPath)
+		if err != nil {
+			t.Fatalf("Dial failed: %v", err)
+		}
+		defer conn.Close()
+
+		env, _ := protocol.NewEnvelope(protocol.TypeExec, protocol.CommandRequest{
+			ID:             "after-exec-disconnect",
+			Command:        "echo",
+			Args:           []string{"ok"},
+			Reason:         "verify sem released",
+			TimeoutSeconds: 5,
+		})
+		if err := json.NewEncoder(conn).Encode(env); err != nil {
+			t.Fatalf("Encode failed: %v", err)
+		}
+		var respEnv protocol.Envelope
+		_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		if err := json.NewDecoder(conn).Decode(&respEnv); err != nil {
+			t.Fatalf("Decode failed: %v", err)
+		}
+		var resp protocol.CommandResponse
+		_ = json.Unmarshal(respEnv.Data, &resp)
+		if resp.Status != protocol.StatusApproved {
+			t.Fatalf("expected StatusApproved on follow-up request, got %s", resp.Status)
+		}
+	})
+}
+
+type pipeListener struct {
+	ch     chan net.Conn
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newPipeListener() *pipeListener {
+	return &pipeListener{
+		ch:     make(chan net.Conn, 16),
+		closed: make(chan struct{}),
+	}
+}
+
+func (l *pipeListener) Accept() (net.Conn, error) {
+	select {
+	case <-l.closed:
+		return nil, net.ErrClosed
+	case c := <-l.ch:
+		return c, nil
+	}
+}
+
+func (l *pipeListener) Close() error {
+	l.once.Do(func() { close(l.closed) })
+	return nil
+}
+
+func (l *pipeListener) Addr() net.Addr {
+	return &net.UnixAddr{Name: "pipe-test", Net: "unix"}
+}
+
+func TestServerShutdownWithQueuedWaitersAndBackpressuredWrites(t *testing.T) {
+	t.Run("active_exec_and_queued_waiter", func(t *testing.T) {
+		tmpDir := shortTempSockDir(t)
+		sockPath := filepath.Join(tmpDir, "s.sock")
+
+		listener, err := net.Listen("unix", sockPath)
+		if err != nil {
+			t.Fatalf("Listen failed: %v", err)
+		}
+
+		executor := NewCommandExecutor(io.Discard, io.Discard)
+		prompter := &mockPrompter{decision: DecisionApprove}
+		server := NewServerWithExecutor(listener, prompter, executor)
+
+		serveDone := make(chan error, 1)
+		go func() { serveDone <- server.Serve() }()
+
+		// Client 1 enters active Execute ("sleep 30")
+		conn1, err := net.Dial("unix", sockPath)
+		if err != nil {
+			t.Fatalf("Dial conn1 failed: %v", err)
+		}
+		defer conn1.Close()
+
+		env1, _ := protocol.NewEnvelope(protocol.TypeExec, protocol.CommandRequest{
+			ID:             "active-exec-shutdown",
+			Command:        "sleep",
+			Args:           []string{"30"},
+			Reason:         "active exec during shutdown",
+			TimeoutSeconds: 30,
+		})
+		if err := json.NewEncoder(conn1).Encode(env1); err != nil {
+			t.Fatalf("Encode 1 failed: %v", err)
+		}
+
+		for i := 0; i < 100 && executor.ActiveChildPid() <= 0; i++ {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if executor.ActiveChildPid() <= 0 {
+			t.Fatal("timed out waiting for active child pid")
+		}
+
+		// Client 2 connects, completes a Ping roundtrip so handleConnection is guaranteed active,
+		// and then queues an Exec request behind Client 1.
+		conn2, err := net.Dial("unix", sockPath)
+		if err != nil {
+			t.Fatalf("Dial conn2 failed: %v", err)
+		}
+		defer conn2.Close()
+
+		pingEnv, _ := protocol.NewEnvelope(protocol.TypePing, protocol.PingRequest{ID: "sync", Timestamp: time.Now()})
+		if err := json.NewEncoder(conn2).Encode(pingEnv); err != nil {
+			t.Fatalf("Encode ping on conn2 failed: %v", err)
+		}
+		var pingResp protocol.Envelope
+		if err := json.NewDecoder(conn2).Decode(&pingResp); err != nil {
+			t.Fatalf("Decode ping on conn2 failed: %v", err)
+		}
+
+		env2, _ := protocol.NewEnvelope(protocol.TypeExec, protocol.CommandRequest{
+			ID:             "queued-waiter-shutdown",
+			Command:        "echo",
+			Args:           []string{"queued"},
+			Reason:         "queued during shutdown",
+			TimeoutSeconds: 30,
+		})
+		if err := json.NewEncoder(conn2).Encode(env2); err != nil {
+			t.Fatalf("Encode 2 failed: %v", err)
+		}
+		time.Sleep(30 * time.Millisecond)
+
+		shutdownStart := time.Now()
+		server.Shutdown()
+
+		select {
+		case <-serveDone:
+			if dur := time.Since(shutdownStart); dur > 500*time.Millisecond {
+				t.Fatalf("Serve() took too long to exit on Shutdown: %v", dur)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Serve() hung during Shutdown with active Execute + queued waiter")
+		}
+
+		for idx, c := range []net.Conn{conn1, conn2} {
+			var respEnv protocol.Envelope
+			_ = c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			if err := json.NewDecoder(c).Decode(&respEnv); err != nil {
+				t.Fatalf("client %d: failed to decode shutdown response: %v", idx+1, err)
+			}
+			var resp protocol.CommandResponse
+			if err := json.Unmarshal(respEnv.Data, &resp); err != nil {
+				t.Fatalf("client %d: unmarshal failed: %v", idx+1, err)
+			}
+			if resp.Status != protocol.StatusRejected || resp.ExitCode != protocol.ExitCodeRejected {
+				t.Fatalf("client %d: expected StatusRejected (126), got status=%s exit=%d", idx+1, resp.Status, resp.ExitCode)
+			}
+			if resp.RejectReason != "Server is shutting down" {
+				t.Fatalf("client %d: expected RejectReason 'Server is shutting down', got %q", idx+1, resp.RejectReason)
+			}
+		}
+	})
+
+	t.Run("backpressured_write_buffers", func(t *testing.T) {
+		pl := newPipeListener()
+		promptBStarted := make(chan struct{}, 1)
+		execADone := make(chan struct{}, 1)
+
+		prompter := &mockPrompter{
+			onPrompt: func(ctx context.Context, req protocol.CommandRequest) (ApprovalDecision, string, string, error) {
+				if req.ID == "conn-a-blocked-write" {
+					defer func() { execADone <- struct{}{} }()
+					return DecisionApprove, "", "", nil
+				}
+				if req.ID == "conn-b-prompt" {
+					promptBStarted <- struct{}{}
+					<-ctx.Done()
+					return DecisionReject, "", "Server is shutting down", context.Cause(ctx)
+				}
+				return DecisionReject, "", "unexpected", nil
+			},
+		}
+
+		server := NewServerWithExecutor(pl, prompter, NewCommandExecutor(io.Discard, io.Discard))
+		serveDone := make(chan error, 1)
+		go func() { serveDone <- server.Serve() }()
+
+		// Conn A: executes "true", then blocks inside writeEnvelope(30s) because peer aCli never reads!
+		aSrv, aCli := net.Pipe()
+		defer aCli.Close()
+		pl.ch <- aSrv
+		go func() {
+			env, _ := protocol.NewEnvelope(protocol.TypeExec, protocol.CommandRequest{
+				ID:             "conn-a-blocked-write",
+				Command:        "true",
+				Reason:         "backpressured write",
+				TimeoutSeconds: 30,
+			})
+			_ = json.NewEncoder(aCli).Encode(env)
+		}()
+		<-execADone
+		// Give Conn A 25ms after Prompt/Execute so it is blocked inside enc.Encode(env)
+		time.Sleep(25 * time.Millisecond)
+
+		// Conn B: active inside Prompt when Shutdown() fires; peer bCli never reads!
+		bSrv, bCli := net.Pipe()
+		defer bCli.Close()
+		pl.ch <- bSrv
+		go func() {
+			env, _ := protocol.NewEnvelope(protocol.TypeExec, protocol.CommandRequest{
+				ID:             "conn-b-prompt",
+				Command:        "true",
+				Reason:         "prompt then backpressured shutdown write",
+				TimeoutSeconds: 30,
+			})
+			_ = json.NewEncoder(bCli).Encode(env)
+		}()
+		<-promptBStarted
+
+		// Conn C: queued behind Conn B when Shutdown() fires; peer cCli never reads!
+		cSrv, cCli := net.Pipe()
+		defer cCli.Close()
+		pl.ch <- cSrv
+		go func() {
+			env, _ := protocol.NewEnvelope(protocol.TypeExec, protocol.CommandRequest{
+				ID:             "conn-c-queued",
+				Command:        "true",
+				Reason:         "queued then backpressured shutdown write",
+				TimeoutSeconds: 30,
+			})
+			_ = json.NewEncoder(cCli).Encode(env)
+		}()
+		time.Sleep(25 * time.Millisecond)
+
+		shutdownStart := time.Now()
+		server.Shutdown()
+
+		select {
+		case <-serveDone:
+			if dur := time.Since(shutdownStart); dur > 500*time.Millisecond {
+				t.Fatalf("Serve() hung on backpressured write during Shutdown: %v (expected < 500ms)", dur)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Serve() hung on blocked conn.Write during Shutdown (up to 30s bug)")
+		}
+	})
+}
+
+func TestServerPostPromptDeadlineAndExplicitRejectPrecedence(t *testing.T) {
+	// 1. If queueCtx deadline expires while Prompt returns DecisionApprove with nil err,
+	// processExec must NOT execute the command and must return StatusTimeout (124).
+	t.Run("approve_after_queue_deadline_times_out", func(t *testing.T) {
+		var outBuf syncBuffer
+		prompter := &mockPrompter{
+			onPrompt: func(ctx context.Context, req protocol.CommandRequest) (ApprovalDecision, string, string, error) {
+				<-ctx.Done()
+				// Simulate a prompter returning DecisionApprove right as queueCtx expires
+				return DecisionApprove, "", "", nil
+			},
+		}
+		s := NewServerWithExecutor(nil, prompter, NewCommandExecutor(&outBuf, &outBuf))
+		c1, c2 := net.Pipe()
+		defer c1.Close()
+		defer c2.Close()
+
+		resp, _ := s.processExec(c1, bufio.NewReader(c1), protocol.CommandRequest{
+			ID:             "late-approve",
+			Command:        "echo",
+			Args:           []string{"SHOULD_NOT_RUN"},
+			Reason:         "deadline race",
+			TimeoutSeconds: 1,
+		}, time.Now().Add(-950*time.Millisecond))
+
+		if resp.Status != protocol.StatusTimeout || resp.ExitCode != protocol.ExitCodeTimeout {
+			t.Fatalf("expected StatusTimeout (124) when queueCtx expired before execution, got status=%s exit=%d", resp.Status, resp.ExitCode)
+		}
+		if strings.Contains(outBuf.String(), "SHOULD_NOT_RUN") {
+			t.Fatalf("command ran after queueCtx deadline expired: %q", outBuf.String())
+		}
+	})
+
+	// 2. If operator explicitly pressed 'n' (DecisionReject) and optional reject reason timed out on queueCtx,
+	// processExec must preserve StatusRejected (126), NOT flip to StatusTimeout (124).
+	t.Run("explicit_reject_with_expired_queue_ctx_stays_rejected", func(t *testing.T) {
+		prompter := &mockPrompter{
+			onPrompt: func(ctx context.Context, req protocol.CommandRequest) (ApprovalDecision, string, string, error) {
+				<-ctx.Done()
+				return DecisionReject, "", "Declined by operator", nil
+			},
+		}
+		s := NewServerWithExecutor(nil, prompter, NewCommandExecutor(io.Discard, io.Discard))
+		c1, c2 := net.Pipe()
+		defer c1.Close()
+		defer c2.Close()
+
+		resp, _ := s.processExec(c1, bufio.NewReader(c1), protocol.CommandRequest{
+			ID:             "explicit-reject-late",
+			Command:        "echo",
+			Args:           []string{"hi"},
+			Reason:         "reject precedence",
+			TimeoutSeconds: 1,
+		}, time.Now().Add(-950*time.Millisecond))
+
+		if resp.Status != protocol.StatusRejected || resp.ExitCode != protocol.ExitCodeRejected {
+			t.Fatalf("expected StatusRejected (126) for explicit operator veto, got status=%s exit=%d", resp.Status, resp.ExitCode)
+		}
+	})
+}
+
+func TestServerMalformedJSONReturnsTypeErrorSilently(t *testing.T) {
+	tmpDir := shortTempSockDir(t)
+	sockPath := filepath.Join(tmpDir, "s.sock")
+
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+	defer listener.Close()
+
+	var outBuf syncBuffer
+	server := NewServerWithExecutor(listener, &mockPrompter{decision: DecisionApprove}, NewCommandExecutor(&outBuf, &outBuf))
+	startTestServer(t, server)
+
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatalf("Dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte("{malformed json\n")); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	var respEnv protocol.Envelope
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	if err := json.NewDecoder(conn).Decode(&respEnv); err != nil {
+		t.Fatalf("Decode TypeError response failed: %v", err)
+	}
+	if respEnv.Type != protocol.TypeError {
+		t.Fatalf("expected TypeError for malformed JSON, got %s", respEnv.Type)
+	}
+	if outBuf.String() != "" {
+		t.Fatalf("unexpected executor output on malformed wire frame: %q", outBuf.String())
+	}
+}
+
+func TestServerPersistentConnectionPipelining(t *testing.T) {
+	// Sends exec + exec + ping in a single conn.Write across < 512B, ~1.5KB, and > 4KB
+	// payload sizes, verifying zero stolen/corrupted bytes and no false disconnects
+	// across json.Decoder internal buffering, partial bufio.Reader compaction, and full 4KB+ buffers.
+	for _, tc := range []struct {
+		name    string
+		padSize int
+		minLen  int
+		maxLen  int
+	}{
+		{name: "under_512B", padSize: 2, minLen: 1, maxLen: 500},
+		{name: "around_1_5KB", padSize: 1100, minLen: 1200, maxLen: 2000},
+		{name: "over_4KB", padSize: 5200, minLen: 5400, maxLen: 8000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := shortTempSockDir(t)
+			sockPath := filepath.Join(tmpDir, "s.sock")
+
+			listener, err := net.Listen("unix", sockPath)
+			if err != nil {
+				t.Fatalf("Listen failed: %v", err)
+			}
+			defer listener.Close()
+
+			prompter := &mockPrompter{
+				decision: DecisionApprove,
+				delay:    65 * time.Millisecond,
+			}
+			server := NewServerWithExecutor(listener, prompter, NewCommandExecutor(io.Discard, io.Discard))
+			startTestServer(t, server)
+
+			conn, err := net.Dial("unix", sockPath)
+			if err != nil {
+				t.Fatalf("Dial failed: %v", err)
+			}
+			defer conn.Close()
+
+			var batch bytes.Buffer
+			enc := json.NewEncoder(&batch)
+
+			id1 := "e1"
+			env1, err := protocol.NewEnvelope(protocol.TypeExec, protocol.CommandRequest{
+				ID:             id1,
+				Command:        "echo",
+				Args:           []string{"one"},
+				Reason:         "p1",
+				TimeoutSeconds: 5,
+			})
+			if err != nil {
+				t.Fatalf("NewEnvelope 1 failed: %v", err)
+			}
+			if err := enc.Encode(env1); err != nil {
+				t.Fatalf("Encode 1 failed: %v", err)
+			}
+
+			pad := strings.Repeat("p", tc.padSize)
+			id2 := "e2"
+			env2, err := protocol.NewEnvelope(protocol.TypeExec, protocol.CommandRequest{
+				ID:             id2,
+				Command:        "echo",
+				Args:           []string{"2-" + pad},
+				Reason:         "p2",
+				TimeoutSeconds: 5,
+			})
+			if err != nil {
+				t.Fatalf("NewEnvelope 2 failed: %v", err)
+			}
+			if err := enc.Encode(env2); err != nil {
+				t.Fatalf("Encode 2 failed: %v", err)
+			}
+
+			pingID := "pg"
+			env3, err := protocol.NewEnvelope(protocol.TypePing, protocol.PingRequest{
+				ID:        pingID,
+				Timestamp: time.Unix(1700000000, 0).UTC(),
+			})
+			if err != nil {
+				t.Fatalf("NewEnvelope 3 failed: %v", err)
+			}
+			if err := enc.Encode(env3); err != nil {
+				t.Fatalf("Encode 3 failed: %v", err)
+			}
+
+			payload := batch.Bytes()
+			if len(payload) < tc.minLen || len(payload) > tc.maxLen {
+				t.Fatalf("unexpected batch size %d (expected in [%d, %d])", len(payload), tc.minLen, tc.maxLen)
+			}
+
+			// Single write delivering all three pipelined frames back-to-back
+			if _, err := conn.Write(payload); err != nil {
+				t.Fatalf("conn.Write batch failed: %v", err)
+			}
+
+			_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			dec := json.NewDecoder(conn)
+
+			// 1. Read exec_resp 1
+			var rEnv1 protocol.Envelope
+			if err := dec.Decode(&rEnv1); err != nil {
+				t.Fatalf("Decode resp 1 failed: %v", err)
+			}
+			if rEnv1.Type != protocol.TypeExecResp {
+				t.Fatalf("resp 1: expected exec_resp, got %s", rEnv1.Type)
+			}
+			var r1 protocol.CommandResponse
+			if err := json.Unmarshal(rEnv1.Data, &r1); err != nil {
+				t.Fatalf("Unmarshal resp 1 failed: %v", err)
+			}
+			if r1.ID != id1 || r1.Status != protocol.StatusApproved {
+				t.Fatalf("resp 1 mismatch: id=%q status=%s reason=%q", r1.ID, r1.Status, r1.RejectReason)
+			}
+			if !strings.Contains(r1.Stdout, "one") {
+				t.Fatalf("resp 1 unexpected stdout: %q", r1.Stdout)
+			}
+
+			// 2. Read exec_resp 2
+			var rEnv2 protocol.Envelope
+			if err := dec.Decode(&rEnv2); err != nil {
+				t.Fatalf("Decode resp 2 failed: %v", err)
+			}
+			if rEnv2.Type != protocol.TypeExecResp {
+				t.Fatalf("resp 2: expected exec_resp, got %s", rEnv2.Type)
+			}
+			var r2 protocol.CommandResponse
+			if err := json.Unmarshal(rEnv2.Data, &r2); err != nil {
+				t.Fatalf("Unmarshal resp 2 failed: %v", err)
+			}
+			if r2.ID != id2 || r2.Status != protocol.StatusApproved {
+				t.Fatalf("resp 2 mismatch: id=%q status=%s reason=%q", r2.ID, r2.Status, r2.RejectReason)
+			}
+			if !strings.Contains(r2.Stdout, "2-"+pad) {
+				t.Fatalf("resp 2 missing padded stdout (len=%d)", len(r2.Stdout))
+			}
+
+			// 3. Read ping_resp 3
+			var rEnv3 protocol.Envelope
+			if err := dec.Decode(&rEnv3); err != nil {
+				t.Fatalf("Decode resp 3 (ping) failed: %v", err)
+			}
+			if rEnv3.Type != protocol.TypePingResp {
+				t.Fatalf("resp 3: expected ping_resp, got %s", rEnv3.Type)
+			}
+			var r3 protocol.PingResponse
+			if err := json.Unmarshal(rEnv3.Data, &r3); err != nil {
+				t.Fatalf("Unmarshal resp 3 failed: %v", err)
+			}
+			if r3.ID != pingID || !r3.Active {
+				t.Fatalf("resp 3 ping mismatch: %+v", r3)
+			}
+		})
 	}
 }

@@ -9,4 +9,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const pollCloseEvents = unix.POLLHUP | unix.POLLRDHUP | unix.POLLERR
+const pollCloseEvents = unix.POLLHUP | unix.POLLRDHUP | unix.POLLERR | unix.POLLNVAL
+
+func hasQueuedPeerEOF(_ uintptr) bool {
+	return false
+}
