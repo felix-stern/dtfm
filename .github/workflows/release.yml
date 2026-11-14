@@ -194,6 +194,7 @@ jobs:
   build:
     name: Hermetic Build & Attest
     needs: verify
+    environment: release
     if: >-
       github.repository == 'iinozemtsev-lab/dtfm' &&
       (
@@ -517,6 +518,7 @@ jobs:
   publish:
     name: Publish Release
     needs: build
+    environment: release
     if: >-
       github.repository == 'iinozemtsev-lab/dtfm' &&
       (
