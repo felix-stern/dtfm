@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version tag (e.g. v0.2.0)'
+        description: 'Release version tag (e.g. v0.4.0)'
         required: true
         type: string
 
@@ -19,14 +19,17 @@ permissions:
   contents: read
 
 jobs:
-  verify-and-build:
-    name: Verify & Build Release
-    if: github.repository == 'iinozemtsev-lab/dtfm'
+  verify:
+    name: Verify Pre-Release Quality Gates
+    if: >-
+      github.repository == 'iinozemtsev-lab/dtfm' &&
+      (
+        (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+      )
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-    outputs:
-      release_sha: ${{ steps.resolve-target.outputs.release_sha }}
+      contents: read
     env:
       EVENT_NAME: ${{ github.event_name }}
       INPUT_VERSION: ${{ inputs.version }}
@@ -154,39 +157,18 @@ jobs:
           echo "PREFLIGHT_TAG_SHA=$existing_tag_sha" >> "$GITHUB_ENV"
           echo "✓ Pre-flight release and tag collision checks passed."
 
-      - name: Finalize CHANGELOG.md locally
+      - name: Validate CHANGELOG.md finalization (dry run)
         if: env.EVENT_NAME == 'workflow_dispatch'
         run: |
-          echo "Finalizing CHANGELOG.md for $TAG..."
-          python3 scripts/finalize-changelog.py "$TAG" CHANGELOG.md
-
-          if git diff --quiet CHANGELOG.md; then
-            echo "NEEDS_MAIN_PUSH=false" >> "$GITHUB_ENV"
-            echo "CHANGELOG.md already finalized; no new commit needed."
-          else
-            if [ -n "${PREFLIGHT_TAG_SHA:-}" ]; then
-              echo "Error: Git tag 'refs/tags/$TAG' already exists on origin at $PREFLIGHT_TAG_SHA; cannot create a new changelog finalization commit!" >&2
-              exit 1
-            fi
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add CHANGELOG.md
-            git commit -m "chore(release): finalize changelog for ${TAG}"
-            echo "NEEDS_MAIN_PUSH=true" >> "$GITHUB_ENV"
-            echo "✓ Committed finalized CHANGELOG.md locally (remote push deferred until all checks and builds pass)."
-          fi
-
-      - name: Resolve target release commit SHA
-        id: resolve-target
-        run: |
-          RELEASE_SHA="$(git rev-parse HEAD)"
-          if [[ ! "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "Error: Resolved invalid RELEASE_SHA '$RELEASE_SHA'!" >&2
+          dry_run_file="${RUNNER_TEMP}/CHANGELOG.finalized.md"
+          python3 scripts/finalize-changelog.py --dry-run "$TAG" CHANGELOG.md > "$dry_run_file"
+          if ! cmp -s CHANGELOG.md "$dry_run_file" && [ -n "${PREFLIGHT_TAG_SHA:-}" ]; then
+            rm -f "$dry_run_file"
+            echo "Error: Git tag 'refs/tags/$TAG' already exists on origin at $PREFLIGHT_TAG_SHA; cannot create a new changelog finalization commit!" >&2
             exit 1
           fi
-          echo "release_sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
-          echo "RELEASE_SHA=$RELEASE_SHA" >> "$GITHUB_ENV"
-          echo "✓ Target release commit SHA: $RELEASE_SHA"
+          rm -f "$dry_run_file"
+          echo "✓ Validated CHANGELOG.md finalization dry run for $TAG."
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -209,16 +191,209 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -W error scripts/test_finalize_changelog.py
           echo "✓ All pre-release quality gates passed."
 
+  build:
+    name: Hermetic Build & Attest
+    needs: verify
+    if: >-
+      github.repository == 'iinozemtsev-lab/dtfm' &&
+      (
+        (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      release_sha: ${{ steps.resolve-target.outputs.release_sha }}
+      needs_main_push: ${{ steps.resolve-target.outputs.needs_main_push }}
+    env:
+      EVENT_NAME: ${{ github.event_name }}
+      INPUT_VERSION: ${{ inputs.version }}
+      REF_NAME: ${{ github.ref_name }}
+    steps:
+      - name: Validate strict SemVer tag
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_VERSION"
+          else
+            TAG="$REF_NAME"
+          fi
+
+          semver_regex='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if [[ "$TAG" == *$'\n'* || "$TAG" == *$'\r'* || ! "$TAG" =~ $semver_regex ]]; then
+            echo "Error: Tag '$TAG' does not conform to strict SemVer (vMAJOR.MINOR.PATCH with no leading zeros)!" >&2
+            exit 1
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "✓ Validated strict SemVer tag: $TAG"
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify branch and commit ancestry on main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "Error: GH_TOKEN is required to fetch origin/main." >&2
+            exit 1
+          fi
+          basic_auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::${basic_auth}"
+
+          GIT_TERMINAL_PROMPT=0 git \
+            -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${basic_auth}" \
+            fetch --no-tags origin +main:refs/remotes/origin/main
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+              echo "Error: Manual release dispatch must run against refs/heads/main, but got '$GITHUB_REF'!" >&2
+              exit 1
+            fi
+
+            HEAD_SHA="$(git rev-parse HEAD)"
+            ORIGIN_MAIN_SHA="$(git rev-parse refs/remotes/origin/main)"
+            if [ "$HEAD_SHA" != "$ORIGIN_MAIN_SHA" ]; then
+              parent_sha="$(git rev-parse --verify refs/remotes/origin/main~1 2>/dev/null || true)"
+              second_parent="$(git rev-parse --verify refs/remotes/origin/main^2 2>/dev/null || true)"
+              tip_subject="$(git log -1 --format=%s refs/remotes/origin/main)"
+              tip_body="$(git log -1 --format=%b refs/remotes/origin/main)"
+              changed_files="$(git diff --name-only "$HEAD_SHA" refs/remotes/origin/main)"
+
+              if [ -z "$second_parent" ] \
+                && [ "$parent_sha" = "$HEAD_SHA" ] \
+                && [ "$tip_subject" = "chore(release): finalize changelog for ${TAG}" ] \
+                && [ -z "$tip_body" ] \
+                && [ "$changed_files" = "CHANGELOG.md" ]; then
+                echo "Detected prior release finalization commit $ORIGIN_MAIN_SHA on top of $HEAD_SHA (workflow re-run); detaching HEAD onto $ORIGIN_MAIN_SHA."
+                git checkout --detach refs/remotes/origin/main
+              else
+                echo "Error: origin/main advanced from $HEAD_SHA to $ORIGIN_MAIN_SHA since workflow_dispatch was queued!" >&2
+                exit 1
+              fi
+            fi
+          else
+            if ! git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
+              echo "Error: Commit $(git rev-parse HEAD) for release $TAG is not an ancestor of main!" >&2
+              exit 1
+            fi
+          fi
+          echo "✓ Verified target commit $(git rev-parse HEAD) on main."
+
+      - name: Verify pre-flight release and tag collision guards
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "Error: GH_TOKEN is required for release and tag collision checks." >&2
+            exit 1
+          fi
+
+          api_output="$(gh api -i "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" 2>&1 || true)"
+          http_status="$(printf '%s\n' "$api_output" | awk '/^HTTP\/[0-9.]* / { status=$2; if (status !~ /^(1|3)/) exit } END { if (status != "") print status }')"
+          if [ "$http_status" != "404" ]; then
+            echo "Error: Expected HTTP 404 for release '$TAG', got HTTP ${http_status:-unknown}!" >&2
+            echo "$api_output" >&2
+            exit 1
+          fi
+
+          basic_auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::${basic_auth}"
+
+          ls_remote_out="$(GIT_TERMINAL_PROMPT=0 git \
+            -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${basic_auth}" \
+            ls-remote --tags "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" "refs/tags/$TAG" "refs/tags/$TAG^{}")"
+          existing_tag_sha="$(printf '%s\n' "$ls_remote_out" | awk -v r="refs/tags/$TAG" '$2 == r { sha=$1 } $2 == r "^{}" { peeled=$1 } END { print (peeled != "" ? peeled : sha) }')"
+          current_head="$(git rev-parse HEAD)"
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ -n "$existing_tag_sha" ] && [ "$existing_tag_sha" != "$current_head" ]; then
+              echo "Error: Git tag 'refs/tags/$TAG' already exists on origin pointing to commit $existing_tag_sha, but current HEAD is $current_head!" >&2
+              exit 1
+            fi
+          else
+            if [ -z "$existing_tag_sha" ] || [ "$existing_tag_sha" != "$current_head" ]; then
+              echo "Error: Git tag 'refs/tags/$TAG' on origin does not match current commit $current_head (found: '$existing_tag_sha')!" >&2
+              exit 1
+            fi
+          fi
+          echo "PREFLIGHT_TAG_SHA=$existing_tag_sha" >> "$GITHUB_ENV"
+          echo "✓ Pre-flight release and tag collision checks passed."
+
+      # Note on SLSA provenance source-commit semantics:
+      # Under Option A (workflow_dispatch), GitHub Actions fixes OIDC token claims ($GITHUB_REF
+      # and $GITHUB_SHA) at workflow trigger time (refs/heads/main at the pre-finalization parent
+      # commit), while this step creates a local child commit (RELEASE_SHA) touching CHANGELOG.md
+      # and stages a git bundle so the publish job can push RELEASE_SHA after attestation checks.
+      # Under Option B (v* tag push), $GITHUB_REF is refs/tags/<TAG> and $GITHUB_SHA equals RELEASE_SHA.
+      - name: Finalize CHANGELOG.md locally
+        if: env.EVENT_NAME == 'workflow_dispatch'
+        run: |
+          mkdir -p staging
+          echo "Finalizing CHANGELOG.md for $TAG..."
+          python3 scripts/finalize-changelog.py "$TAG" CHANGELOG.md
+
+          if git diff --quiet CHANGELOG.md; then
+            echo "NEEDS_MAIN_PUSH=false" >> "$GITHUB_ENV"
+            echo "CHANGELOG.md already finalized; no new commit needed."
+          else
+            if [ -n "${PREFLIGHT_TAG_SHA:-}" ]; then
+              echo "Error: Git tag 'refs/tags/$TAG' already exists on origin at $PREFLIGHT_TAG_SHA; cannot create a new changelog finalization commit!" >&2
+              exit 1
+            fi
+            parent_sha="$(git rev-parse HEAD)"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add CHANGELOG.md
+            git commit -m "chore(release): finalize changelog for ${TAG}"
+            git bundle create staging/release-commit.bundle "${parent_sha}..HEAD"
+            echo "NEEDS_MAIN_PUSH=true" >> "$GITHUB_ENV"
+            echo "✓ Committed finalized CHANGELOG.md locally and staged git bundle (remote push deferred to publish job after attestation verification)."
+          fi
+
+      - name: Resolve target release commit SHA
+        id: resolve-target
+        run: |
+          RELEASE_SHA="$(git rev-parse HEAD)"
+          if [[ ! "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Error: Resolved invalid RELEASE_SHA '$RELEASE_SHA'!" >&2
+            exit 1
+          fi
+          NEEDS_MAIN_PUSH="${NEEDS_MAIN_PUSH:-false}"
+          if [[ "$NEEDS_MAIN_PUSH" != "true" && "$NEEDS_MAIN_PUSH" != "false" ]]; then
+            echo "Error: Invalid NEEDS_MAIN_PUSH value '$NEEDS_MAIN_PUSH'!" >&2
+            exit 1
+          fi
+          echo "release_sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "needs_main_push=$NEEDS_MAIN_PUSH" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_SHA=$RELEASE_SHA" >> "$GITHUB_ENV"
+          echo "✓ Target release commit SHA: $RELEASE_SHA (needs_main_push=$NEEDS_MAIN_PUSH)"
+
       - name: Extract Release Notes from CHANGELOG.md
         run: |
-          python3 scripts/extract-changelog.py "$TAG" CHANGELOG.md RELEASE_NOTES.md
-          touch RELEASE_NOTES.md
-          if [ ! -s "RELEASE_NOTES.md" ]; then
+          mkdir -p staging
+          python3 scripts/extract-changelog.py "$TAG" CHANGELOG.md staging/RELEASE_NOTES.md
+          touch staging/RELEASE_NOTES.md
+          if [ ! -s "staging/RELEASE_NOTES.md" ]; then
             echo "::warning::No release notes extracted from CHANGELOG.md for tag $TAG; falling back to automatic GitHub release notes."
           fi
 
+      - name: Set up Go (hermetic, uncached)
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+          cache: false
+
       - name: Build static binaries and package reproducible archives
         run: |
+          go mod download
+          go mod verify
+
           VERSION="${TAG#v}"
           PLATFORMS=("darwin/arm64" "darwin/amd64" "linux/amd64" "linux/arm64")
           SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
@@ -233,16 +408,19 @@ jobs:
 
             echo "Building hermetic static binaries for ${os}/${arch} (${TAG})..."
             CGO_ENABLED=0 GOOS="${os}" GOARCH="${arch}" go build \
+              -mod=readonly \
               -trimpath \
               -ldflags="-s -w -X 'main.version=${TAG}'" \
               -o "${target_dir}/dtfm" ./cmd/dtfm
 
             CGO_ENABLED=0 GOOS="${os}" GOARCH="${arch}" go build \
+              -mod=readonly \
               -trimpath \
               -ldflags="-s -w -X 'main.version=${TAG}'" \
               -o "${target_dir}/lmdtfy" ./cmd/lmdtfy
 
             CGO_ENABLED=0 GOOS="${os}" GOARCH="${arch}" go build \
+              -mod=readonly \
               -trimpath \
               -ldflags="-s -w -X 'main.version=${TAG}'" \
               -o "${target_dir}/relay" ./cmd/relay
@@ -317,9 +495,172 @@ jobs:
         run: |
           rm -f SHA256SUMS
           sha256sum * > SHA256SUMS
-          sha256sum -c SHA256SUMS
+          sha256sum --strict -c SHA256SUMS
           echo "Generated cryptographic checksums:"
           cat SHA256SUMS
+
+      - name: Generate build provenance attestations
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: 'artifacts/*'
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-assets
+          path: |
+            artifacts/
+            staging/
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    name: Publish Release
+    needs: build
+    if: >-
+      github.repository == 'iinozemtsev-lab/dtfm' &&
+      (
+        (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      attestations: read
+    env:
+      EVENT_NAME: ${{ github.event_name }}
+      INPUT_VERSION: ${{ inputs.version }}
+      REF_NAME: ${{ github.ref_name }}
+      RELEASE_SHA: ${{ needs.build.outputs.release_sha }}
+      NEEDS_MAIN_PUSH: ${{ needs.build.outputs.needs_main_push }}
+    steps:
+      - name: Checkout repository for deferred changelog push
+        if: env.EVENT_NAME == 'workflow_dispatch' && env.NEEDS_MAIN_PUSH == 'true'
+        uses: actions/checkout@v5
+        with:
+          path: changelog-repo
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download release assets
+        uses: actions/download-artifact@v7
+        with:
+          name: release-assets
+
+      - name: Verify release assets, checksums, and SLSA attestations
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "Error: GH_TOKEN is required to verify release attestations." >&2
+            exit 1
+          fi
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_VERSION"
+          else
+            TAG="$REF_NAME"
+          fi
+
+          semver_regex='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if [[ "$TAG" == *$'\n'* || "$TAG" == *$'\r'* || ! "$TAG" =~ $semver_regex ]]; then
+            echo "Error: Tag '$TAG' does not conform to strict SemVer!" >&2
+            exit 1
+          fi
+
+          if [[ ! "${RELEASE_SHA:-}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Error: Missing or invalid 40-char RELEASE_SHA '${RELEASE_SHA:-}' from build!" >&2
+            exit 1
+          fi
+          if [[ "${NEEDS_MAIN_PUSH:-}" != "true" && "${NEEDS_MAIN_PUSH:-}" != "false" ]]; then
+            echo "Error: Missing or invalid NEEDS_MAIN_PUSH '${NEEDS_MAIN_PUSH:-}' from build!" >&2
+            exit 1
+          fi
+
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "TARGET_SHA=$RELEASE_SHA" >> "$GITHUB_ENV"
+
+          # 1. Assert artifacts/ structure and exact 1-to-1 file membership with SHA256SUMS
+          if [ ! -d artifacts ] || [ ! -f artifacts/SHA256SUMS ]; then
+            echo "Error: artifacts/ directory or artifacts/SHA256SUMS is missing!" >&2
+            exit 1
+          fi
+
+          unexpected_entries="$(
+            find artifacts -mindepth 2 -print
+            find artifacts -mindepth 1 -maxdepth 1 \( ! -type f -o -name '.*' \) -print
+          )"
+          if [ -n "$unexpected_entries" ]; then
+            echo "Error: Unexpected nested, hidden, or non-regular entries in artifacts/:" >&2
+            echo "$unexpected_entries" >&2
+            exit 1
+          fi
+
+          actual_files="$(cd artifacts && find . -maxdepth 1 -type f ! -name 'SHA256SUMS' -printf '%f\n' | LC_ALL=C sort)"
+          checksum_files="$(awk '{
+            if (NF < 2 || $1 !~ /^[0-9a-f]{64}$/) { exit 2 }
+            line = $0
+            sub(/^[0-9a-f]{64} [ *]/, "", line)
+            print line
+          }' artifacts/SHA256SUMS | LC_ALL=C sort)" || {
+            echo "Error: Malformed checksum entry in artifacts/SHA256SUMS!" >&2
+            exit 1
+          }
+
+          actual_count="$(printf '%s\n' "$actual_files" | sed '/^$/d' | wc -l | tr -d ' ')"
+          if [ "$actual_count" -ne 16 ]; then
+            echo "Error: Expected 16 release assets alongside SHA256SUMS, found $actual_count!" >&2
+            exit 1
+          fi
+          if [ "$actual_files" != "$checksum_files" ]; then
+            echo "Error: File membership mismatch between artifacts/ and SHA256SUMS!" >&2
+            echo "Actual files in artifacts/:" >&2
+            echo "$actual_files" >&2
+            echo "Files listed in SHA256SUMS:" >&2
+            echo "$checksum_files" >&2
+            exit 1
+          fi
+
+          echo "Re-verifying cryptographic SHA256SUMS..."
+          (cd artifacts && sha256sum --strict -c SHA256SUMS)
+
+          # 2. Verify live SLSA v1.0 build provenance attestations on SHA256SUMS and all 16 assets
+          echo "Verifying Sigstore / SLSA v1.0 attestations against GitHub Attestations API..."
+          gh --version
+          shopt -s nullglob
+          asset_list=(artifacts/*)
+          shopt -u nullglob
+          if [ "${#asset_list[@]}" -ne 17 ]; then
+            echo "Error: Expected 17 total files in artifacts/, found ${#asset_list[@]}!" >&2
+            exit 1
+          fi
+
+          for asset in "${asset_list[@]}"; do
+            verified=false
+            last_out=""
+            for attempt in 1 2 3 4; do
+              if last_out="$(gh attestation verify "$asset" \
+                --repo "$GITHUB_REPOSITORY" \
+                --deny-self-hosted-runners \
+                --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
+                --source-ref "$GITHUB_REF" \
+                --source-digest "$GITHUB_SHA" 2>&1)"; then
+                echo "✓ Verified attestation: $asset"
+                verified=true
+                break
+              fi
+              if [ "$attempt" -lt 4 ]; then
+                echo "Attestation lookup/verify attempt $attempt/4 failed for $asset; retrying in $((attempt * 3))s..." >&2
+                sleep "$((attempt * 3))"
+              fi
+            done
+            if [ "$verified" != "true" ]; then
+              echo "Error: Failed to verify SLSA provenance attestation for $asset:" >&2
+              printf '%s\n' "$last_out" >&2
+              exit 1
+            fi
+          done
+          echo "✓ Verified checksums, exact asset membership, and SLSA attestations for all 17 files."
 
       - name: Push finalized CHANGELOG.md to main
         if: env.EVENT_NAME == 'workflow_dispatch' && env.NEEDS_MAIN_PUSH == 'true'
@@ -331,7 +672,7 @@ jobs:
             exit 1
           fi
 
-          # Re-verify no published release or remote tag appeared during verification and builds
+          # Re-verify no published release appeared before mutating origin/main
           api_output="$(gh api -i "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" 2>&1 || true)"
           http_status="$(printf '%s\n' "$api_output" | awk '/^HTTP\/[0-9.]* / { status=$2; if (status !~ /^(1|3)/) exit } END { if (status != "") print status }')"
           if [ "$http_status" != "404" ]; then
@@ -343,46 +684,76 @@ jobs:
           basic_auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
           echo "::add-mask::${basic_auth}"
 
-          ls_remote_out="$(GIT_TERMINAL_PROMPT=0 git \
+          GIT_TERMINAL_PROMPT=0 git -C changelog-repo \
+            -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${basic_auth}" \
+            fetch --no-tags origin +main:refs/remotes/origin/main
+
+          ls_remote_out="$(GIT_TERMINAL_PROMPT=0 git -C changelog-repo \
             -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${basic_auth}" \
             ls-remote --tags "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" "refs/tags/$TAG" "refs/tags/$TAG^{}")"
           existing_tag_sha="$(printf '%s\n' "$ls_remote_out" | awk -v r="refs/tags/$TAG" '$2 == r { sha=$1 } $2 == r "^{}" { peeled=$1 } END { print (peeled != "" ? peeled : sha) }')"
-          if [ -n "$existing_tag_sha" ]; then
-            echo "Error: Git tag 'refs/tags/$TAG' already exists on origin ($existing_tag_sha); aborting push to main!" >&2
+
+          ORIGIN_MAIN_SHA="$(git -C changelog-repo rev-parse refs/remotes/origin/main)"
+          if [ "$ORIGIN_MAIN_SHA" = "$TARGET_SHA" ]; then
+            parent_sha="$(git -C changelog-repo rev-parse --verify "${TARGET_SHA}^1" 2>/dev/null || true)"
+            second_parent="$(git -C changelog-repo rev-parse --verify "${TARGET_SHA}^2" 2>/dev/null || true)"
+            tip_subject="$(git -C changelog-repo log -1 --format=%s "$TARGET_SHA")"
+            tip_body="$(git -C changelog-repo log -1 --format=%b "$TARGET_SHA")"
+            changed_files="$(git -C changelog-repo diff --name-only "$GITHUB_SHA" "$TARGET_SHA")"
+            if [ -n "$second_parent" ] \
+              || [ "$parent_sha" != "$GITHUB_SHA" ] \
+              || [ "$tip_subject" != "chore(release): finalize changelog for ${TAG}" ] \
+              || [ -n "$tip_body" ] \
+              || [ "$changed_files" != "CHANGELOG.md" ]; then
+              echo "Error: origin/main commit $TARGET_SHA does not match expected changelog finalization commit invariants!" >&2
+              exit 1
+            fi
+            if [ -n "$existing_tag_sha" ] && [ "$existing_tag_sha" != "$TARGET_SHA" ]; then
+              echo "Error: Git tag 'refs/tags/$TAG' on origin ($existing_tag_sha) conflicts with $TARGET_SHA!" >&2
+              exit 1
+            fi
+            echo "✓ Finalized CHANGELOG.md commit $TARGET_SHA is already at tip of origin/main (idempotent job re-run); skipping push."
+          elif [ "$ORIGIN_MAIN_SHA" = "$GITHUB_SHA" ]; then
+            if [ -n "$existing_tag_sha" ]; then
+              echo "Error: Git tag 'refs/tags/$TAG' already exists on origin ($existing_tag_sha); aborting push to main!" >&2
+              exit 1
+            fi
+            bundle_path="${GITHUB_WORKSPACE}/staging/release-commit.bundle"
+            if [ ! -f "$bundle_path" ]; then
+              echo "Error: Expected git bundle '$bundle_path' is missing!" >&2
+              exit 1
+            fi
+
+            git -C changelog-repo bundle verify "$bundle_path"
+            git -C changelog-repo fetch "$bundle_path" "$TARGET_SHA"
+            fetched_sha="$(git -C changelog-repo rev-parse FETCH_HEAD)"
+            if [ "$fetched_sha" != "$TARGET_SHA" ]; then
+              echo "Error: Unbundled commit $fetched_sha does not match TARGET_SHA $TARGET_SHA!" >&2
+              exit 1
+            fi
+
+            parent_sha="$(git -C changelog-repo rev-parse --verify "${TARGET_SHA}^1" 2>/dev/null || true)"
+            second_parent="$(git -C changelog-repo rev-parse --verify "${TARGET_SHA}^2" 2>/dev/null || true)"
+            commit_subject="$(git -C changelog-repo log -1 --format=%s "$TARGET_SHA")"
+            commit_body="$(git -C changelog-repo log -1 --format=%b "$TARGET_SHA")"
+            changed_files="$(git -C changelog-repo diff --name-only "$ORIGIN_MAIN_SHA" "$TARGET_SHA")"
+            if [ -n "$second_parent" ] \
+              || [ "$parent_sha" != "$ORIGIN_MAIN_SHA" ] \
+              || [ "$commit_subject" != "chore(release): finalize changelog for ${TAG}" ] \
+              || [ -n "$commit_body" ] \
+              || [ "$changed_files" != "CHANGELOG.md" ]; then
+              echo "Error: Unbundled commit $TARGET_SHA failed changelog finalization commit invariants!" >&2
+              exit 1
+            fi
+
+            GIT_TERMINAL_PROMPT=0 git -C changelog-repo \
+              -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${basic_auth}" \
+              push origin "${TARGET_SHA}:refs/heads/main"
+            echo "✓ Pushed finalized CHANGELOG.md commit $TARGET_SHA to origin/main."
+          else
+            echo "Error: origin/main moved from $GITHUB_SHA to $ORIGIN_MAIN_SHA before publish!" >&2
             exit 1
           fi
-
-          GIT_TERMINAL_PROMPT=0 git \
-            -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${basic_auth}" \
-            push origin HEAD:refs/heads/main
-          echo "✓ Pushed finalized CHANGELOG.md commit $(git rev-parse HEAD) to origin/main."
-
-      - name: Upload release assets
-        uses: actions/upload-artifact@v6
-        with:
-          name: release-assets
-          path: |
-            artifacts/
-            RELEASE_NOTES.md
-          retention-days: 3
-
-  publish:
-    name: Publish Release
-    needs: verify-and-build
-    if: github.repository == 'iinozemtsev-lab/dtfm'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    env:
-      EVENT_NAME: ${{ github.event_name }}
-      INPUT_VERSION: ${{ inputs.version }}
-      REF_NAME: ${{ github.ref_name }}
-      RELEASE_SHA: ${{ needs.verify-and-build.outputs.release_sha }}
-    steps:
-      - name: Download release assets
-        uses: actions/download-artifact@v7
-        with:
-          name: release-assets
 
       - name: Publish GitHub Release
         env:
@@ -392,25 +763,9 @@ jobs:
             echo "Error: GH_TOKEN is required to publish GitHub Release." >&2
             exit 1
           fi
-
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            TAG="$INPUT_VERSION"
-          else
-            TAG="$REF_NAME"
-          fi
           export TAG
 
-          if [[ ! "${RELEASE_SHA:-}" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "Error: Missing or invalid 40-char RELEASE_SHA '${RELEASE_SHA:-}' from verify-and-build!" >&2
-            exit 1
-          fi
-          TARGET_SHA="$RELEASE_SHA"
-
-          # 1. Re-verify cryptographic SHA256SUMS before publishing
-          echo "Re-verifying cryptographic SHA256SUMS..."
-          (cd artifacts && sha256sum -c SHA256SUMS)
-
-          # 2. Re-verify fail-closed published release check and remote tag-SHA invariant
+          # 1. Re-verify fail-closed published release check and remote tag-SHA invariant
           api_output="$(gh api -i "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" 2>&1 || true)"
           http_status="$(printf '%s\n' "$api_output" | awk '/^HTTP\/[0-9.]* / { status=$2; if (status !~ /^(1|3)/) exit } END { if (status != "") print status }')"
           if [ "$http_status" = "200" ]; then
@@ -443,22 +798,22 @@ jobs:
             fi
           fi
 
-          # 3. Enumerate and delete all stale draft releases matching TAG by exact release ID
+          # 2. Enumerate and delete all stale draft releases matching TAG by exact release ID
           draft_ids="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq '.[] | select(.draft == true and .tag_name == env.TAG) | .id')"
           for id in $draft_ids; do
             echo "Cleaning up stale draft release ID $id for $TAG..."
             gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/${id}"
           done
 
-          # 4. Determine release flags
+          # 3. Determine release flags
           extra_flags=()
           tag_core="${TAG%%+*}"
           if [[ "$tag_core" == *-* ]]; then
             extra_flags+=("--prerelease")
           fi
 
-          if [ -s "RELEASE_NOTES.md" ]; then
-            extra_flags+=("--notes-file" "RELEASE_NOTES.md")
+          if [ -s "staging/RELEASE_NOTES.md" ]; then
+            extra_flags+=("--notes-file" "staging/RELEASE_NOTES.md")
           else
             extra_flags+=("--generate-notes")
           fi
@@ -470,7 +825,7 @@ jobs:
             target_flags+=("--verify-tag")
           fi
 
-          # 5. Single-step release creation (no split --draft + edit)
+          # 4. Single-step release creation (no split --draft + edit)
           echo "Publishing release $TAG..."
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \

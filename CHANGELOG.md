@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Cryptographically signed SLSA v1.0 build provenance and artifact attestations for all release archives, standalone binaries, and checksum files in `.github/workflows/release.yml` using `actions/attest-build-provenance@v4`, with least-privilege hermetic build isolation and pre-publish attestation verification ([#31](https://github.com/iinozemtsev-lab/dtfm/issues/31)).
+
 ## [0.3.0] - 2026-11-11
 
 ### Added
