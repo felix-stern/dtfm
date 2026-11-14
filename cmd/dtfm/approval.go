@@ -132,10 +132,18 @@ func (p *TerminalPrompter) colorBold(s string) string {
 }
 
 // NewTerminalPrompter creates a prompter reading from /dev/tty if available,
-// falling back to os.Stdin/os.Stdout (e.g. for testing or headless environments).
+// falling back to os.Stdin/os.Stdout (e.g. for testing, macOS indirect /dev/tty poll limitations, or headless environments).
 func NewTerminalPrompter() *TerminalPrompter {
 	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if err == nil {
+		pfd := []unix.PollFd{{Fd: int32(tty.Fd()), Events: unix.POLLIN}}
+		if _, pollErr := unix.Poll(pfd, 0); pollErr == nil && (pfd[0].Revents&unix.POLLNVAL) == 0 {
+			return newPrompter(tty, tty, tty)
+		}
+		if isTerminalFD(os.Stdin.Fd()) {
+			_ = tty.Close()
+			return newPrompter(os.Stdin, os.Stdout, os.Stdin)
+		}
 		return newPrompter(tty, tty, tty)
 	}
 	return newPrompter(os.Stdin, os.Stdout, os.Stdin)
@@ -1138,16 +1146,14 @@ func (p *TerminalPrompter) DrainPendingInput() error {
 	}
 
 	if p.isTTY {
-		var scratch [256]byte
-		for p.hasPendingInput(0) {
-			if p.reader.Buffered() > 0 {
-				_, _ = p.reader.Discard(p.reader.Buffered())
-				continue
-			}
-			n, err := p.reader.Read(scratch[:])
-			if n <= 0 || err != nil {
-				break
-			}
+		signal.Ignore(syscall.SIGTTOU, syscall.SIGTTIN)
+		orig, err := getTermios(p.file.Fd())
+		if err == nil {
+			err = restoreTermios(p.file.Fd(), orig)
+		}
+		signal.Reset(syscall.SIGTTOU, syscall.SIGTTIN)
+		if err != nil {
+			return fmt.Errorf("failed to flush terminal input queue: %w", err)
 		}
 	}
 
