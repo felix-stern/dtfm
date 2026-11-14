@@ -97,6 +97,8 @@ lmdtfy ping --relay "https://<relay-host>/c/<session-id>#<key>"
 lmdtfy exec --relay "https://<relay-host>/c/<session-id>#<key>" --why "run migrations" make db-migrate
 ```
 
+For production VPS deployment with systemd, Nginx, automated TLS, and auto-updates, see the [Self-Hosting Relay Runbook](docs/host_relay.md).
+
 </details>
 
 ### 3. Hand Off to Your Agent
@@ -223,6 +225,7 @@ Approved commands forward the executed process's exit code (`0–255`) verbatim.
 ## Documentation & Releases
 
 - Agent onboarding manual: [docs/lmdtfy_guide.md](docs/lmdtfy_guide.md)
+- Self-hosting relay runbook: [docs/host_relay.md](docs/host_relay.md)
 - Maintainer release procedures: [docs/releasing.md](docs/releasing.md)
 - Release history and notes: [CHANGELOG.md](CHANGELOG.md)
 
