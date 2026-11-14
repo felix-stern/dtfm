@@ -159,7 +159,7 @@ sequenceDiagram
     end
 ```
 
-- **Interactive Approvals & Inline Editing**: Requests are displayed in lossless POSIX / ANSI-C (`$'...'`) shell syntax with visibly escaped terminal control codes and Trojan Source bidi characters. Operators can edit commands inline with Readline-style keybindings (`[e]`) before running, and pending TTY input is flushed prior to prompting so pre-typed keystrokes cannot auto-approve requests.
+- **Interactive Approvals & Inline Editing**: Single-line requests are displayed in lossless POSIX / ANSI-C (`$'...'`) shell syntax with Readline-style inline editing (`[e]`), while multiline scripts render inside a numbered left gutter (`[y]` Run / `[n]` Reject) with visibly escaped terminal control codes and Trojan Source bidi characters. Pending TTY input is flushed prior to prompting so pre-typed keystrokes cannot auto-approve requests.
 - **Fail-Closed Security**: Dead stdin/EOF, backgrounded TTYs, TTY input-flush errors, and closed client connections immediately reject execution (exit code `126`). Any custom environment variables are rejected upfront (e.g., `LD_*`, `PATH`).
 - **Bounded Resources**: Request frames are capped at 4 MiB; captured `stdout` and `stderr` are bounded to 1 MiB per stream (16 MiB max serialized response envelope).
 - **Controlling Terminal Handover (`TIOCSPGRP` / `Ctty`)**: When `dtfm` runs in the foreground on `/dev/tty`, approved child processes receive foreground terminal control (`TIOCSPGRP`). This lets authenticators like `sudo`, `ssh`, or `pinentry` prompt the operator directly on `/dev/tty` for passwords without triggering `SIGTTOU` or `SIGTTIN`, restoring original `termios` attributes (`TCSAFLUSH`) upon completion.

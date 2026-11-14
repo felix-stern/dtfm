@@ -305,13 +305,19 @@ func (p *TerminalPrompter) Prompt(ctx context.Context, req protocol.CommandReque
 		fmt.Fprintln(p.writer, "────────────────────────────────────────────────────────────")
 	}
 
+	isMultiline := totalCmdLines > 1
+
 	// Set promptStartTime AFTER DrainPendingInput and after the banner is presented to the operator
 	p.mu.Lock()
 	p.promptStartTime = time.Now()
 	p.mu.Unlock()
 
 	for {
-		fmt.Fprintf(p.writer, "Approve execution? [%s] Run  [%s] Edit  [%s] Reject: ", p.colorBold("y"), p.colorBold("e"), p.colorBold("n"))
+		if isMultiline {
+			fmt.Fprintf(p.writer, "Approve execution? [%s] Run  [%s] Reject: ", p.colorBold("y"), p.colorBold("n"))
+		} else {
+			fmt.Fprintf(p.writer, "Approve execution? [%s] Run  [%s] Edit  [%s] Reject: ", p.colorBold("y"), p.colorBold("e"), p.colorBold("n"))
+		}
 		line, err := p.readLineWithContext(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -331,6 +337,17 @@ func (p *TerminalPrompter) Prompt(ctx context.Context, req protocol.CommandReque
 			return DecisionApprove, "", "", nil
 
 		case "e", "edit":
+			if isMultiline {
+				fmt.Fprintf(p.writer, "⚠️  Inline edit is disabled for multiline commands. Choose [%s] Run, or [%s] Reject with feedback so the agent can resend.\n", p.colorBold("y"), p.colorBold("n"))
+				if err := p.DrainPendingInput(); err != nil {
+					fmt.Fprintf(p.writer, "\n❌ Terminal input queue flush failed: %v. Request rejected for safety.\n", err)
+					return DecisionReject, "", "cannot flush terminal input", err
+				}
+				p.mu.Lock()
+				p.promptStartTime = time.Now()
+				p.mu.Unlock()
+				continue
+			}
 			if len([]rune(cleanCmd)) > maxEditRunes {
 				fmt.Fprintf(p.writer, "⚠️  Command exceeds maximum interactive edit length (%d > %d chars). Please choose [%s] Run or [%s] Reject.\n", len([]rune(cleanCmd)), maxEditRunes, p.colorBold("y"), p.colorBold("n"))
 				if err := p.DrainPendingInput(); err != nil {
@@ -400,7 +417,11 @@ func (p *TerminalPrompter) Prompt(ctx context.Context, req protocol.CommandReque
 
 		case "":
 			// Explicitly reject empty enter as approval
-			fmt.Fprintln(p.writer, "Empty response. Please explicitly type 'y', 'e', or 'n'.")
+			if isMultiline {
+				fmt.Fprintln(p.writer, "Empty response. Please explicitly type 'y' or 'n'.")
+			} else {
+				fmt.Fprintln(p.writer, "Empty response. Please explicitly type 'y', 'e', or 'n'.")
+			}
 			if err := p.DrainPendingInput(); err != nil {
 				fmt.Fprintf(p.writer, "\n❌ Terminal input queue flush failed: %v. Request rejected for safety.\n", err)
 				return DecisionReject, "", "cannot flush terminal input", err
@@ -410,7 +431,11 @@ func (p *TerminalPrompter) Prompt(ctx context.Context, req protocol.CommandReque
 			p.mu.Unlock()
 
 		default:
-			fmt.Fprintln(p.writer, "Invalid input. Please enter 'y', 'e', or 'n'.")
+			if isMultiline {
+				fmt.Fprintln(p.writer, "Invalid input. Please enter 'y' or 'n'.")
+			} else {
+				fmt.Fprintln(p.writer, "Invalid input. Please enter 'y', 'e', or 'n'.")
+			}
 			if err := p.DrainPendingInput(); err != nil {
 				fmt.Fprintf(p.writer, "\n❌ Terminal input queue flush failed: %v. Request rejected for safety.\n", err)
 				return DecisionReject, "", "cannot flush terminal input", err

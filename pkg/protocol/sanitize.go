@@ -361,8 +361,8 @@ func FormatCompactCommand(command string, args []string) string {
 }
 
 // SanitizeDisplayLine sanitizes a single line of a multiline argument for gutter-boxed terminal display.
-// Because this output is used strictly for human review display (while [e] inline edit uses lossless
-// FormatCommand $'...' quoting and direct execution passes the original req.Command / req.Args slice to execvp),
+// Because this output is used strictly for human review display (inline [e] editing is disabled for
+// multiline commands, and direct execution passes the original req.Command / req.Args slice to execvp),
 // printable characters — including single/double quotes and literal backslashes — render naturally without
 // $'...' quoting noise, and tabs expand to 4 spaces to avoid right-margin VT100 tab truncation.
 // Every control code, carriage return, ANSI escape, invalid UTF-8 byte, and Trojan Source bidi/invisible rune

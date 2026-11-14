@@ -2154,7 +2154,7 @@ func TestApprovalMultilinePromptSpoofingAndEscapeHighlighting(t *testing.T) {
 	defer prompter.Close()
 
 	// Adversarial payload attempting to forge dtfm's border/prompt at column 0 and inject CR/ANSI/Bidi
-	spoofScript := "echo safe\n" + strings.Repeat("─", 40) + "\nApprove execution? [y] Run  [e] Edit  [n] Reject: y\r\x1b[2K\u202e"
+	spoofScript := "echo safe\n" + strings.Repeat("─", 40) + "\nApprove execution? [y] Run  [n] Reject: y\r\x1b[2K\u202e"
 	req := protocol.CommandRequest{
 		ID:      "test-multiline-spoof",
 		Reason:  "Test anti-spoofing gutter",
@@ -2210,7 +2210,152 @@ func TestApprovalMultilinePromptSpoofingAndEscapeHighlighting(t *testing.T) {
 	}
 }
 
-func TestApprovalMultilineEditPreservesValidAnsiCShellSyntax(t *testing.T) {
+func waitForOutputCount(buf *syncBuffer, substr string, wantCount int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if strings.Count(buf.String(), substr) >= wantCount {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
+}
+
+func TestApprovalMultilineDisablesInlineEdit(t *testing.T) {
+	t.Run("PTYMultilineArgRejectsEditAndReprompts", func(t *testing.T) {
+		ptmx, pts, err := pty.Open()
+		if err != nil {
+			t.Fatalf("Failed to open PTY: %v", err)
+		}
+		defer ptmx.Close()
+		defer pts.Close()
+
+		go func() {
+			_, _ = io.Copy(io.Discard, ptmx)
+		}()
+
+		var stdout syncBuffer
+		prompter := newPrompter(pts, &stdout, pts)
+		defer prompter.Close()
+
+		req := protocol.CommandRequest{
+			ID:      "test-multiline-no-edit",
+			Reason:  "Disable 1-line Readline edit on multiline scripts",
+			Command: "bash",
+			Args:    []string{"-c", "printf 'first\\n'\nprintf 'second\\n'"},
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		go func() {
+			if !waitForOutputCount(&stdout, "Approve execution?", 1, 2*time.Second) {
+				return
+			}
+			_, _ = ptmx.Write([]byte("e\n"))
+			if !waitForOutputCount(&stdout, "Approve execution?", 2, 2*time.Second) {
+				return
+			}
+			_, _ = ptmx.Write([]byte("\n"))
+			if !waitForOutputCount(&stdout, "Approve execution?", 3, 2*time.Second) {
+				return
+			}
+			_, _ = ptmx.Write([]byte("z\n"))
+			if !waitForOutputCount(&stdout, "Approve execution?", 4, 2*time.Second) {
+				return
+			}
+			_, _ = ptmx.Write([]byte("EDIT\n"))
+			if !waitForOutputCount(&stdout, "Approve execution?", 5, 2*time.Second) {
+				return
+			}
+			_, _ = ptmx.Write([]byte("n\n"))
+			if !waitForPromptOutput(&stdout, "Reject reason (optional): ", 2*time.Second) {
+				return
+			}
+			_, _ = ptmx.Write([]byte("Please split into two steps\n"))
+		}()
+
+		decision, edited, reason, err := prompter.Prompt(ctx, req)
+		if err != nil {
+			t.Fatalf("Unexpected Prompt error: %v", err)
+		}
+		if decision != DecisionReject {
+			t.Fatalf("Expected DecisionReject, got %v (edited=%q)", decision, edited)
+		}
+		if edited != "" {
+			t.Fatalf("Expected empty edited command, got %q", edited)
+		}
+		if reason != "Please split into two steps" {
+			t.Fatalf("Expected reject reason 'Please split into two steps', got %q", reason)
+		}
+
+		out := stdout.String()
+		if strings.Contains(out, "Edit  [") || strings.Contains(out, "Edit command") {
+			t.Errorf("Multiline prompt must omit [e] Edit option and never enter Readline edit mode:\n%s", out)
+		}
+		if !strings.Contains(out, "Inline edit is disabled for multiline commands") {
+			t.Errorf("Expected warning when typing e/EDIT on multiline command:\n%s", out)
+		}
+		if !strings.Contains(out, "Empty response. Please explicitly type 'y' or 'n'.") {
+			t.Errorf("Expected multiline empty-response hint without 'e':\n%s", out)
+		}
+		if !strings.Contains(out, "Invalid input. Please enter 'y' or 'n'.") {
+			t.Errorf("Expected multiline invalid-input hint without 'e':\n%s", out)
+		}
+		if strings.Contains(out, "'y', 'e', or 'n'") {
+			t.Errorf("Multiline validation hints must not advertise 'e':\n%s", out)
+		}
+	})
+
+	t.Run("MultilineCommandNameAlsoDisablesEditAndApprovesWithY", func(t *testing.T) {
+		r, w := io.Pipe()
+		defer r.Close()
+		defer w.Close()
+
+		var stdout syncBuffer
+		prompter := NewStreamPrompter(r, &stdout)
+		defer prompter.Close()
+
+		req := protocol.CommandRequest{
+			ID:      "test-multiline-cmd-no-edit",
+			Reason:  "Multiline argv[0] also omits [e] Edit",
+			Command: "weird\ncmd",
+			Args:    []string{"--flag"},
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		go func() {
+			if !waitForOutputCount(&stdout, "Approve execution?", 1, 2*time.Second) {
+				return
+			}
+			_, _ = w.Write([]byte("e\n"))
+			if !waitForOutputCount(&stdout, "Approve execution?", 2, 2*time.Second) {
+				return
+			}
+			_, _ = w.Write([]byte("y\n"))
+		}()
+
+		decision, edited, _, err := prompter.Prompt(ctx, req)
+		if err != nil {
+			t.Fatalf("Unexpected Prompt error: %v", err)
+		}
+		if decision != DecisionApprove || edited != "" {
+			t.Fatalf("Expected DecisionApprove with empty edited, got decision=%v edited=%q", decision, edited)
+		}
+
+		out := stdout.String()
+		if !strings.Contains(out, "Approve execution? [y] Run  [n] Reject: ") {
+			t.Errorf("Expected [y] Run  [n] Reject prompt without [e] Edit, got:\n%s", out)
+		}
+		if !strings.Contains(out, "Inline edit is disabled for multiline commands.") {
+			t.Errorf("Expected warning when typing 'e' on multiline command, got:\n%s", out)
+		}
+	})
+}
+
+func TestApprovalSingleLineAnsiCEditExecutesCleanlyViaShell(t *testing.T) {
 	ptmx, pts, err := pty.Open()
 	if err != nil {
 		t.Fatalf("Failed to open PTY: %v", err)
@@ -2226,11 +2371,12 @@ func TestApprovalMultilineEditPreservesValidAnsiCShellSyntax(t *testing.T) {
 	prompter := newPrompter(pts, &stdout, pts)
 	defer prompter.Close()
 
+	// Single-line command containing a tab triggers ANSI-C $'...' quoting while keeping [e] Edit enabled
 	req := protocol.CommandRequest{
-		ID:      "test-multiline-edit",
-		Reason:  "Verify [e] edit keeps single-line $'...' syntax and executes cleanly via ExecuteShell",
+		ID:      "test-singleline-ansic-edit",
+		Reason:  "Verify single-line $'...' edit still works and executes cleanly via ExecuteShell",
 		Command: "bash",
-		Args:    []string{"-c", "printf 'first\\n'\nprintf 'second\\n'"},
+		Args:    []string{"-c", "printf 'first\tsecond\\n'"},
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -2245,7 +2391,6 @@ func TestApprovalMultilineEditPreservesValidAnsiCShellSyntax(t *testing.T) {
 		if !waitForPromptOutput(&stdout, "Edit command", 2*time.Second) {
 			return
 		}
-		// Cursor starts at end of pre-populated $'...' buffer; append shell clause and submit
 		_, _ = ptmx.Write([]byte(appendSuffix + "\r"))
 	}()
 
@@ -2267,7 +2412,7 @@ func TestApprovalMultilineEditPreservesValidAnsiCShellSyntax(t *testing.T) {
 	if resp.ExitCode != 0 {
 		t.Fatalf("Expected ExecuteShell exit code 0, got %d (stderr: %s)", resp.ExitCode, resp.Stderr)
 	}
-	if wantStdout := "first\nsecond\nedited-ok\n"; resp.Stdout != wantStdout {
+	if wantStdout := "first\tsecond\nedited-ok\n"; resp.Stdout != wantStdout {
 		t.Fatalf("ExecuteShell stdout mismatch: got %q, want %q", resp.Stdout, wantStdout)
 	}
 }
