@@ -192,21 +192,22 @@ func ParseTrustedProxies(s string) ([]*net.IPNet, error) {
 }
 
 type Hub struct {
-	mu                   sync.RWMutex
-	sessions             map[string]*Session
-	sessionsPerIP        map[string]int
-	idleTimeout          time.Duration
-	maxSessions          int
-	maxSessionsPerIP     int
-	trustedProxies       []*net.IPNet
-	exemptLoopback       bool
-	allowExtensionOrigin bool
-	frameAuthTimeout     time.Duration
-	upgrader             websocket.Upgrader
-	ctx                  context.Context
-	cancel               context.CancelFunc
-	wg                   sync.WaitGroup
-	logWriter            io.Writer
+	mu               sync.RWMutex
+	sessions         map[string]*Session
+	sessionsPerIP    map[string]int
+	pendingAuth      int
+	pendingAuthPerIP map[string]int
+	idleTimeout      time.Duration
+	maxSessions      int
+	maxSessionsPerIP int
+	trustedProxies   []*net.IPNet
+	exemptLoopback   bool
+	frameAuthTimeout time.Duration
+	upgrader         websocket.Upgrader
+	ctx              context.Context
+	cancel           context.CancelFunc
+	wg               sync.WaitGroup
+	logWriter        io.Writer
 }
 
 func NewHubWithConfig(cfg HubConfig) *Hub {
@@ -225,18 +226,18 @@ func NewHubWithConfig(cfg HubConfig) *Hub {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &Hub{
-		sessions:             make(map[string]*Session),
-		sessionsPerIP:        make(map[string]int),
-		idleTimeout:          idleTimeout,
-		maxSessions:          maxSessions,
-		maxSessionsPerIP:     cfg.MaxSessionsPerIP,
-		trustedProxies:       trusted,
-		exemptLoopback:       cfg.ExemptLoopback,
-		allowExtensionOrigin: cfg.AllowExtensionOrigin,
-		frameAuthTimeout:     defaultFrameAuthTimeout,
-		ctx:                  ctx,
-		cancel:               cancel,
-		logWriter:            cfg.LogWriter,
+		sessions:         make(map[string]*Session),
+		sessionsPerIP:    make(map[string]int),
+		pendingAuthPerIP: make(map[string]int),
+		idleTimeout:      idleTimeout,
+		maxSessions:      maxSessions,
+		maxSessionsPerIP: cfg.MaxSessionsPerIP,
+		trustedProxies:   trusted,
+		exemptLoopback:   cfg.ExemptLoopback,
+		frameAuthTimeout: defaultFrameAuthTimeout,
+		ctx:              ctx,
+		cancel:           cancel,
+		logWriter:        cfg.LogWriter,
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  32 * 1024,
 			WriteBufferSize: 32 * 1024,
@@ -436,7 +437,7 @@ func (h *Hub) isIPRateLimited(ipStr string, fromForwarded bool) bool {
 	if !fromForwarded && ip != nil && ip.IsLoopback() && h.exemptLoopback {
 		return false
 	}
-	return h.sessionsPerIP[ipStr] >= h.maxSessionsPerIP
+	return (h.sessionsPerIP[ipStr] + h.pendingAuthPerIP[ipStr]) >= h.maxSessionsPerIP
 }
 
 type authCredentials struct {
@@ -506,9 +507,30 @@ func readFrameAuth(conn *websocket.Conn, role string, timeout time.Duration) (au
 	}
 }
 
-func (h *Hub) validatePreUpgrade(r *http.Request, sessionID, role string) error {
+func (h *Hub) reservePendingSlot(ip string) func() {
+	h.pendingAuth++
+	h.pendingAuthPerIP[ip]++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			h.mu.Lock()
+			if h.pendingAuth > 0 {
+				h.pendingAuth--
+			}
+			if h.pendingAuthPerIP[ip] > 0 {
+				h.pendingAuthPerIP[ip]--
+				if h.pendingAuthPerIP[ip] == 0 {
+					delete(h.pendingAuthPerIP, ip)
+				}
+			}
+			h.mu.Unlock()
+		})
+	}
+}
+
+func (h *Hub) validatePreUpgrade(r *http.Request, sessionID, role string) (func(), error) {
 	if err := e2ee.ValidateSessionID(sessionID); err != nil {
-		return errInvalidSessionID
+		return nil, errInvalidSessionID
 	}
 
 	useHeaderAuth := hasAuthHeaders(r)
@@ -521,63 +543,64 @@ func (h *Hub) validatePreUpgrade(r *http.Request, sessionID, role string) error 
 
 	if role == e2ee.RoleOperator {
 		if !exists {
-			if len(h.sessions) >= h.maxSessions {
-				return errMaxSessions
+			if len(h.sessions)+h.pendingAuth >= h.maxSessions {
+				return nil, errMaxSessions
 			}
 			if h.isIPRateLimited(ip, fromForwarded) {
-				return errMaxSessionsPerIP
+				return nil, errMaxSessionsPerIP
 			}
 			if useHeaderAuth {
 				c, err := parseHeaderAuth(r, role)
 				if err != nil || !c.hasAgentVerifier {
-					return errUnauthorized
+					return nil, errUnauthorized
 				}
+				return nil, nil
 			}
-			return nil
+			return h.reservePendingSlot(ip), nil
 		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if s.closed {
-			return errSessionNotFound
+			return nil, errSessionNotFound
 		}
 		if useHeaderAuth && s.hasAuth {
 			c, err := parseHeaderAuth(r, role)
 			if err != nil {
-				return errUnauthorized
+				return nil, errUnauthorized
 			}
 			hash := sha256.Sum256(c.rawAuth[:])
 			if subtle.ConstantTimeCompare(hash[:], s.opVerifier[:]) != 1 {
-				return errUnauthorized
+				return nil, errUnauthorized
 			}
 		}
-		return nil
+		return nil, nil
 
 	} else if role == e2ee.RoleAgent {
 		if !exists {
-			return errSessionNotFound
+			return nil, errSessionNotFound
 		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if s.closed || s.operator == nil {
-			return errSessionNotFound
+			return nil, errSessionNotFound
 		}
 		if s.agent != nil {
-			return errSessionBusy
+			return nil, errSessionBusy
 		}
 		if useHeaderAuth && s.hasAuth {
 			c, err := parseHeaderAuth(r, role)
 			if err != nil {
-				return errUnauthorized
+				return nil, errUnauthorized
 			}
 			hash := sha256.Sum256(c.rawAuth[:])
 			if subtle.ConstantTimeCompare(hash[:], s.agentVerifier[:]) != 1 {
-				return errUnauthorized
+				return nil, errUnauthorized
 			}
 		}
-		return nil
+		return nil, nil
 	}
 
-	return fmt.Errorf("unknown role: %q", role)
+	return nil, fmt.Errorf("unknown role: %q", role)
 }
 
 func (h *Hub) Register(r *http.Request, sessionID, role string, conn *websocket.Conn, creds authCredentials) (*Client, error) {
@@ -594,7 +617,7 @@ func (h *Hub) Register(r *http.Request, sessionID, role string, conn *websocket.
 
 	if role == e2ee.RoleOperator {
 		if !exists {
-			if len(h.sessions) >= h.maxSessions {
+			if len(h.sessions)+h.pendingAuth >= h.maxSessions {
 				return nil, errMaxSessions
 			}
 			if h.isIPRateLimited(ip, fromForwarded) {
@@ -768,7 +791,8 @@ func (h *Hub) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.validatePreUpgrade(r, sessionID, role); err != nil {
+	releasePending, err := h.validatePreUpgrade(r, sessionID, role)
+	if err != nil {
 		switch {
 		case errors.Is(err, errSessionNotFound):
 			http.Error(w, "session not found or operator not connected", http.StatusNotFound)
@@ -783,6 +807,9 @@ func (h *Hub) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if releasePending != nil {
+		defer releasePending()
+	}
 
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -795,12 +822,15 @@ func (h *Hub) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		creds, err = parseHeaderAuth(r, role)
 	} else {
 		creds, err = readFrameAuth(conn, role, h.frameAuthTimeout)
+		if releasePending != nil {
+			releasePending()
+		}
 	}
 	if err != nil {
 		h.logf("auth error for %s (%s): %v", sessionID, role, err)
 		_ = conn.WriteControl(websocket.CloseMessage,
 			websocket.FormatCloseMessage(4003, errUnauthorized.Error()),
-			time.Now().Add(writeWait))
+			time.Now().Add(time.Second))
 		_ = conn.Close()
 		return
 	}

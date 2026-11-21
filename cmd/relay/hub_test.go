@@ -974,4 +974,184 @@ func TestHubFrameAuthAgent(t *testing.T) {
 	if resp == nil || resp.StatusCode != http.StatusConflict {
 		t.Fatalf("expected 409 Conflict, got resp=%v err=%v", resp, err)
 	}
+
+	// 5. Malformed, oversized (>128B), text, wrong-opcode, and timed-out agent FrameAuth -> close 4003 without leaks
+	agentConn.Close()
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		hub.mu.RLock()
+		s := hub.sessions[sessionID]
+		hub.mu.RUnlock()
+		if s != nil {
+			s.mu.Lock()
+			busy := s.agent != nil
+			s.mu.Unlock()
+			if !busy {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for agent disconnect")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	oversized := make([]byte, 200)
+	oversized[0] = e2ee.FrameAuth
+
+	badAgentFrames := []struct {
+		name      string
+		msgType   int
+		payload   []byte
+		oversized bool
+	}{
+		{"too_short_32", websocket.BinaryMessage, make([]byte, 32), false},
+		{"too_long_34", websocket.BinaryMessage, make([]byte, 34), false},
+		{"op_len_65", websocket.BinaryMessage, make([]byte, 65), false},
+		{"wrong_opcode", websocket.BinaryMessage, append([]byte{e2ee.FrameData}, make([]byte, 32)...), false},
+		{"text_frame", websocket.TextMessage, buildAgentFrameAuth(t, agentAuth), false},
+		{"oversized_200", websocket.BinaryMessage, oversized, true},
+	}
+	for _, tc := range badAgentFrames {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _, err := websocket.DefaultDialer.Dial(agentURL, nil)
+			if err != nil {
+				t.Fatalf("dial failed: %v", err)
+			}
+			defer c.Close()
+			if err := c.WriteMessage(tc.msgType, tc.payload); err != nil {
+				t.Fatalf("write failed: %v", err)
+			}
+			if tc.oversized {
+				_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+				if _, _, err := c.ReadMessage(); err == nil {
+					t.Fatal("expected oversized FrameAuth to disconnect")
+				}
+			} else {
+				assertWSCloseCode(t, c, 4003)
+			}
+			if hub.ActiveSessionsCount() != 1 {
+				t.Fatalf("expected 1 active session, got %d", hub.ActiveSessionsCount())
+			}
+			hub.mu.RLock()
+			ipCount := len(hub.sessionsPerIP)
+			hub.mu.RUnlock()
+			if ipCount != 1 {
+				t.Fatalf("expected 1 sessionsPerIP entry, got %d", ipCount)
+			}
+		})
+	}
+
+	t.Run("timeout", func(t *testing.T) {
+		c, _, err := websocket.DefaultDialer.Dial(agentURL, nil)
+		if err != nil {
+			t.Fatalf("dial failed: %v", err)
+		}
+		defer c.Close()
+		assertWSCloseCode(t, c, 4003)
+	})
+}
+
+func TestHubFrameAuthPerIPAndGlobalCap(t *testing.T) {
+	t.Run("per_ip_cap", func(t *testing.T) {
+		hub := NewHubWithConfig(HubConfig{
+			IdleTimeout:      time.Minute,
+			MaxSessions:      10,
+			MaxSessionsPerIP: 2,
+			ExemptLoopback:   false,
+		})
+		hub.frameAuthTimeout = 100 * time.Millisecond
+		defer hub.Close()
+
+		ts := httptest.NewServer(hub)
+		defer ts.Close()
+		wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws"
+
+		c1, _, err := websocket.DefaultDialer.Dial(wsURL+"?session=probe-1&role=operator", nil)
+		if err != nil {
+			t.Fatalf("probe-1 dial failed: %v", err)
+		}
+		defer c1.Close()
+
+		c2, _, err := websocket.DefaultDialer.Dial(wsURL+"?session=probe-2&role=operator", nil)
+		if err != nil {
+			t.Fatalf("probe-2 dial failed: %v", err)
+		}
+		defer c2.Close()
+
+		// 3rd stalled FrameAuth connection from same IP must be rejected pre-upgrade with 503
+		_, resp, err := websocket.DefaultDialer.Dial(wsURL+"?session=probe-3&role=operator", nil)
+		if err == nil {
+			t.Fatal("expected probe-3 to be rejected due to pending per-IP cap")
+		}
+		if resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 Service Unavailable, got resp=%v err=%v", resp, err)
+		}
+
+		// Both stalled connections time out with 4003 and release pending slots
+		assertWSCloseCode(t, c1, 4003)
+		assertWSCloseCode(t, c2, 4003)
+
+		hub.mu.RLock()
+		pending := hub.pendingAuth
+		pendingIPs := len(hub.pendingAuthPerIP)
+		sessionsIPs := len(hub.sessionsPerIP)
+		hub.mu.RUnlock()
+		if hub.ActiveSessionsCount() != 0 || pending != 0 || pendingIPs != 0 || sessionsIPs != 0 {
+			t.Fatalf("expected clean counters after timeout, got sessions=%d pending=%d pendingIPs=%d sessionsIPs=%d",
+				hub.ActiveSessionsCount(), pending, pendingIPs, sessionsIPs)
+		}
+
+		// Subsequent connection succeeds
+		c3, _, err := websocket.DefaultDialer.Dial(wsURL+"?session=probe-3&role=operator", nil)
+		if err != nil {
+			t.Fatalf("probe-3 dial after release failed: %v", err)
+		}
+		c3.Close()
+	})
+
+	t.Run("global_cap", func(t *testing.T) {
+		hub := NewHubWithConfig(HubConfig{
+			IdleTimeout:      time.Minute,
+			MaxSessions:      2,
+			MaxSessionsPerIP: 0,
+		})
+		hub.frameAuthTimeout = 100 * time.Millisecond
+		defer hub.Close()
+
+		ts := httptest.NewServer(hub)
+		defer ts.Close()
+		wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws"
+
+		c1, _, err := websocket.DefaultDialer.Dial(wsURL+"?session=gprobe-1&role=operator", nil)
+		if err != nil {
+			t.Fatalf("gprobe-1 dial failed: %v", err)
+		}
+		defer c1.Close()
+
+		c2, _, err := websocket.DefaultDialer.Dial(wsURL+"?session=gprobe-2&role=operator", nil)
+		if err != nil {
+			t.Fatalf("gprobe-2 dial failed: %v", err)
+		}
+		defer c2.Close()
+
+		_, resp, err := websocket.DefaultDialer.Dial(wsURL+"?session=gprobe-3&role=operator", nil)
+		if err == nil {
+			t.Fatal("expected gprobe-3 to be rejected due to pending global cap")
+		}
+		if resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 Service Unavailable, got resp=%v err=%v", resp, err)
+		}
+
+		assertWSCloseCode(t, c1, 4003)
+		assertWSCloseCode(t, c2, 4003)
+
+		hub.mu.RLock()
+		pending := hub.pendingAuth
+		hub.mu.RUnlock()
+		if hub.ActiveSessionsCount() != 0 || pending != 0 {
+			t.Fatalf("expected clean global counters after timeout, got sessions=%d pending=%d",
+				hub.ActiveSessionsCount(), pending)
+		}
+	})
 }
