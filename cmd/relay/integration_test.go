@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -836,5 +837,182 @@ func TestRelayListenerOversizedAgentFrameIsolation(t *testing.T) {
 	_ = json.Unmarshal(respPlain, &env)
 	if env.Type != protocol.TypePingResp {
 		t.Fatalf("expected ping_resp, got %s", env.Type)
+	}
+}
+
+func TestMixedModeExtensionOperatorAndHeaderAgentE2EE(t *testing.T) {
+	hub := NewHubWithConfig(HubConfig{
+		IdleTimeout:          time.Minute,
+		MaxSessions:          100,
+		AllowExtensionOrigin: true,
+	})
+	defer hub.Close()
+
+	ts := httptest.NewServer(hub)
+	defer ts.Close()
+
+	relayWsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws"
+
+	sessionID, err := e2ee.GenerateSessionID()
+	if err != nil {
+		t.Fatalf("GenerateSessionID error: %v", err)
+	}
+	secretKey, _, err := e2ee.GenerateSessionKey()
+	if err != nil {
+		t.Fatalf("GenerateSessionKey error: %v", err)
+	}
+	opAuthHex, agentAuthHex, agentVerifierHex, err := e2ee.DeriveAuthTokens(secretKey, sessionID)
+	if err != nil {
+		t.Fatalf("DeriveAuthTokens error: %v", err)
+	}
+	handshakeKey, err := e2ee.HandshakeKey(secretKey, sessionID)
+	if err != nil {
+		t.Fatalf("HandshakeKey error: %v", err)
+	}
+
+	// 1. Operator connects with chrome-extension:// Origin and NO auth headers, then sends FrameAuth
+	opHeader := make(http.Header)
+	opHeader.Set("Origin", "chrome-extension://abcdefghijklmnop")
+	opURL := relayWsURL + "?session=" + sessionID + "&role=operator"
+	opConn, _, err := websocket.DefaultDialer.Dial(opURL, opHeader)
+	if err != nil {
+		t.Fatalf("extension operator dial failed: %v", err)
+	}
+	defer opConn.Close()
+
+	opRaw, _ := hex.DecodeString(opAuthHex)
+	verRaw, _ := hex.DecodeString(agentVerifierHex)
+	frameAuth := make([]byte, 65)
+	frameAuth[0] = e2ee.FrameAuth
+	copy(frameAuth[1:33], opRaw)
+	copy(frameAuth[33:65], verRaw)
+	if err := opConn.WriteMessage(websocket.BinaryMessage, frameAuth); err != nil {
+		t.Fatalf("operator FrameAuth write failed: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for hub.ActiveSessionsCount() != 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if hub.ActiveSessionsCount() != 1 {
+		t.Fatalf("expected 1 active session, got %d", hub.ActiveSessionsCount())
+	}
+
+	// 2. Agent connects using standard X-DTFM-Auth HTTP header
+	agentHeader := make(http.Header)
+	agentHeader.Set("X-DTFM-Auth", agentAuthHex)
+	agentURL := relayWsURL + "?session=" + sessionID + "&role=agent"
+	agentConn, _, err := websocket.DefaultDialer.Dial(agentURL, agentHeader)
+	if err != nil {
+		t.Fatalf("header agent dial failed: %v", err)
+	}
+	defer agentConn.Close()
+
+	// 3. Complete E2EE handshake and encrypted ping exchange
+	_ = opConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, msg, err := opConn.ReadMessage()
+	if err != nil || len(msg) != 9 || msg[0] != e2ee.FrameAgentConnected {
+		t.Fatalf("expected FrameAgentConnected, got err=%v bytes=%x", err, msg)
+	}
+	connID := binary.BigEndian.Uint64(msg[1:9])
+
+	opNonce, opPacket, err := e2ee.BuildOperatorHandshake(handshakeKey, sessionID)
+	if err != nil {
+		t.Fatalf("BuildOperatorHandshake error: %v", err)
+	}
+	outFrame := make([]byte, 9+len(opPacket))
+	outFrame[0] = e2ee.FrameData
+	binary.BigEndian.PutUint64(outFrame[1:9], connID)
+	copy(outFrame[9:], opPacket)
+	if err := opConn.WriteMessage(websocket.BinaryMessage, outFrame); err != nil {
+		t.Fatalf("operator write handshake error: %v", err)
+	}
+
+	agentNonce, agentPacket, err := e2ee.BuildAgentHandshake(handshakeKey, sessionID)
+	if err != nil {
+		t.Fatalf("BuildAgentHandshake error: %v", err)
+	}
+	if err := agentConn.WriteMessage(websocket.BinaryMessage, agentPacket); err != nil {
+		t.Fatalf("agent write handshake error: %v", err)
+	}
+
+	_ = agentConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, rcvOpPacket, err := agentConn.ReadMessage()
+	if err != nil {
+		t.Fatalf("agent read handshake error: %v", err)
+	}
+	rcvOpNonce, err := e2ee.VerifyOperatorHandshake(handshakeKey, sessionID, rcvOpPacket)
+	if err != nil {
+		t.Fatalf("VerifyOperatorHandshake error: %v", err)
+	}
+	agentCipher, err := e2ee.DeriveConnCipher(e2ee.RoleAgent, sessionID, secretKey, rcvOpNonce, agentNonce)
+	if err != nil {
+		t.Fatalf("agent DeriveConnCipher error: %v", err)
+	}
+
+	_, msg, err = opConn.ReadMessage()
+	if err != nil || len(msg) < 9 || msg[0] != e2ee.FrameData {
+		t.Fatalf("operator read agent handshake error: %v", err)
+	}
+	rcvAgentNonce, err := e2ee.VerifyAgentHandshake(handshakeKey, sessionID, msg[9:])
+	if err != nil {
+		t.Fatalf("VerifyAgentHandshake error: %v", err)
+	}
+	opCipher, err := e2ee.DeriveConnCipher(e2ee.RoleOperator, sessionID, secretKey, opNonce, rcvAgentNonce)
+	if err != nil {
+		t.Fatalf("operator DeriveConnCipher error: %v", err)
+	}
+
+	// Agent sends encrypted ping
+	pingEnv, _ := protocol.NewEnvelope(protocol.TypePing, protocol.PingRequest{ID: "mixed-ping"})
+	pingBytes, _ := json.Marshal(pingEnv)
+	encPing, err := agentCipher.EncryptRecord(e2ee.RecordTypeData, pingBytes)
+	if err != nil {
+		t.Fatalf("agent EncryptRecord error: %v", err)
+	}
+	if err := agentConn.WriteMessage(websocket.BinaryMessage, encPing); err != nil {
+		t.Fatalf("agent write ping error: %v", err)
+	}
+
+	// Operator receives and decrypts ping, sends encrypted pong
+	_, msg, err = opConn.ReadMessage()
+	if err != nil || len(msg) < 9 || msg[0] != e2ee.FrameData {
+		t.Fatalf("operator read ping error: %v", err)
+	}
+	recType, plainPing, err := opCipher.DecryptRecord(msg[9:])
+	if err != nil || recType != e2ee.RecordTypeData {
+		t.Fatalf("operator DecryptRecord error: %v (type=%d)", err, recType)
+	}
+	var gotPing protocol.Envelope
+	if err := json.Unmarshal(plainPing, &gotPing); err != nil || gotPing.Type != protocol.TypePing {
+		t.Fatalf("expected ping envelope, got %q (err=%v)", string(plainPing), err)
+	}
+
+	respEnv, _ := protocol.NewEnvelope(protocol.TypePingResp, protocol.PingResponse{ID: "mixed-ping", Active: true})
+	respBytes, _ := json.Marshal(respEnv)
+	encResp, err := opCipher.EncryptRecord(e2ee.RecordTypeData, respBytes)
+	if err != nil {
+		t.Fatalf("operator EncryptRecord error: %v", err)
+	}
+	respFrame := make([]byte, 9+len(encResp))
+	respFrame[0] = e2ee.FrameData
+	binary.BigEndian.PutUint64(respFrame[1:9], connID)
+	copy(respFrame[9:], encResp)
+	if err := opConn.WriteMessage(websocket.BinaryMessage, respFrame); err != nil {
+		t.Fatalf("operator write ping_resp error: %v", err)
+	}
+
+	// Agent receives and decrypts ping_resp
+	_, encRespMsg, err := agentConn.ReadMessage()
+	if err != nil {
+		t.Fatalf("agent read ping_resp error: %v", err)
+	}
+	recType, plainResp, err := agentCipher.DecryptRecord(encRespMsg)
+	if err != nil || recType != e2ee.RecordTypeData {
+		t.Fatalf("agent DecryptRecord error: %v (type=%d)", err, recType)
+	}
+	var gotResp protocol.Envelope
+	if err := json.Unmarshal(plainResp, &gotResp); err != nil || gotResp.Type != protocol.TypePingResp {
+		t.Fatalf("expected ping_resp envelope, got %q (err=%v)", string(plainResp), err)
 	}
 }

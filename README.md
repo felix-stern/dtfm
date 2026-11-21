@@ -212,7 +212,7 @@ make cross  # Cross-compile release binaries in bin/dist/
 - `dtfm ssh-config <host> [-w|--write] [--socket <path>] [--config <path>]`: Generate or atomically write `~/.ssh/config` `RemoteForward` block.
 - `lmdtfy ping [--socket <path>] [--relay <token-or-url>] [--relay-url <url>]`: Test operator listener connectivity.
 - `lmdtfy exec --why "<reason>" [--socket <path>] [--relay <token-or-url>] [--relay-url <url>] [--timeout <sec>] [--cwd <path>] -- <cmd>...`: Dispatch command for human review (`--timeout` defaults to `300` seconds, max `86400`, bounding review and execution separately).
-- `dtfm-relay [--listen <addr>] [--idle-timeout <dur>] [--max-sessions <n>] [--max-sessions-per-ip <n>] [--trusted-proxies <cidrs>] [--verbose]`: Standalone in-memory WebSocket streaming relay server (`cmd/relay`, published as `relay-<os>-<arch>`).
+- `dtfm-relay [--listen <addr>] [--idle-timeout <dur>] [--max-sessions <n>] [--max-sessions-per-ip <n>] [--trusted-proxies <cidrs>] [--allow-extension-origin] [--verbose]`: Standalone in-memory WebSocket streaming relay server (`cmd/relay`, published as `relay-<os>-<arch>`).
 - `dtfm --version` / `lmdtfy --version` / `dtfm-relay --version`: Display version information.
 
 ### Environment Variables

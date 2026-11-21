@@ -52,6 +52,7 @@ const (
 	FrameData              byte = 0x01
 	FrameAgentConnected    byte = 0x02
 	FrameAgentDisconnected byte = 0x03
+	FrameAuth              byte = 0x04
 	FrameKickAgent         byte = 0x06
 )
 
