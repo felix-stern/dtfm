@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Opt-in `--allow-extension-origin` flag in `dtfm-relay` (`cmd/relay`) allowing `chrome-extension://` and `moz-extension://` WebSocket origins ([#42](https://github.com/iinozemtsev-lab/dtfm/issues/42), [#43](https://github.com/iinozemtsev-lab/dtfm/pull/43)).
+- Post-upgrade binary `FrameAuth` (`0x04`) fallback in `dtfm-relay` (`pkg/e2ee`, `cmd/relay`) for browser WebSocket clients that cannot set custom HTTP upgrade headers, preserving full backwards compatibility with header-authenticated CLI clients ([#42](https://github.com/iinozemtsev-lab/dtfm/issues/42), [#43](https://github.com/iinozemtsev-lab/dtfm/pull/43)).
+
 ## [0.4.0] - 2026-11-14
 
 ### Added
