@@ -59,6 +59,109 @@ func waitForHTTP(t *testing.T, url string, timeout time.Duration) {
 	t.Fatalf("timed out waiting for HTTP endpoint %s", url)
 }
 
+const maxCapturedPTYBytes = 64 * 1024
+
+type ptyCredentialParser struct {
+	pending            bytes.Buffer
+	expectMagicLink    bool
+	expectPairingToken bool
+	magicLink          string
+	pairingToken       string
+}
+
+func (p *ptyCredentialParser) feed(chunk []byte) (magicLink, pairingToken string, ready bool) {
+	if p.magicLink != "" && p.pairingToken != "" {
+		return p.magicLink, p.pairingToken, true
+	}
+
+	p.pending.Write(chunk)
+	lines := strings.Split(p.pending.String(), "\n")
+	if len(lines) > 1 {
+		for i := 0; i < len(lines)-1; i++ {
+			l := lines[i]
+			trimmed := strings.TrimSpace(l)
+			if p.expectMagicLink {
+				if trimmed != "" {
+					p.magicLink = trimmed
+					p.expectMagicLink = false
+				}
+				continue
+			}
+			if p.expectPairingToken {
+				if trimmed != "" {
+					p.pairingToken = trimmed
+					p.expectPairingToken = false
+				}
+				continue
+			}
+			if strings.Contains(l, "Agent Magic Link:") {
+				p.expectMagicLink = true
+			}
+			if strings.Contains(l, "Pairing Token:") {
+				p.expectPairingToken = true
+			}
+		}
+		p.pending.Reset()
+		p.pending.WriteString(lines[len(lines)-1])
+	}
+
+	return p.magicLink, p.pairingToken, p.magicLink != "" && p.pairingToken != ""
+}
+
+func TestPTYCredentialParserChunkSplits(t *testing.T) {
+	sample := "Banner line\r\nAgent Magic Link:\r\n  https://dtfm.dev/c/sess-1#abc123  \r\n\r\nPairing Token:\r\n  sess-1#abc123\r\n\r\nReady.\r\n"
+
+	t.Run("byte-by-byte", func(t *testing.T) {
+		var p ptyCredentialParser
+		var gotLink, gotToken string
+		var ready bool
+		for i := 0; i < len(sample); i++ {
+			gotLink, gotToken, ready = p.feed([]byte{sample[i]})
+		}
+		if !ready {
+			t.Fatalf("expected parser to be ready, got link=%q token=%q", gotLink, gotToken)
+		}
+		if gotLink != "https://dtfm.dev/c/sess-1#abc123" {
+			t.Fatalf("unexpected magicLink: %q", gotLink)
+		}
+		if gotToken != "sess-1#abc123" {
+			t.Fatalf("unexpected pairingToken: %q", gotToken)
+		}
+	})
+
+	t.Run("split-right-after-headers", func(t *testing.T) {
+		splitAfter := func(s, marker string) []string {
+			idx := strings.Index(s, marker)
+			if idx < 0 {
+				t.Fatalf("marker %q not found", marker)
+			}
+			cut := idx + len(marker)
+			return []string{s[:cut], s[cut:]}
+		}
+
+		// First split right after "Agent Magic Link:\r\n", then mid-token after "Pairing Token:\r\n  sess-"
+		parts := splitAfter(sample, "Agent Magic Link:\r\n")
+		rest := splitAfter(parts[1], "Pairing Token:\r\n  sess-")
+		chunks := []string{parts[0], rest[0], rest[1]}
+
+		var p ptyCredentialParser
+		var gotLink, gotToken string
+		var ready bool
+		for _, c := range chunks {
+			gotLink, gotToken, ready = p.feed([]byte(c))
+		}
+		if !ready {
+			t.Fatalf("expected parser to be ready, got link=%q token=%q", gotLink, gotToken)
+		}
+		if gotLink != "https://dtfm.dev/c/sess-1#abc123" {
+			t.Fatalf("unexpected magicLink: %q", gotLink)
+		}
+		if gotToken != "sess-1#abc123" {
+			t.Fatalf("unexpected pairingToken: %q", gotToken)
+		}
+	})
+}
+
 func TestRelayCLIFlow(t *testing.T) {
 	binDir := t.TempDir()
 
@@ -102,34 +205,29 @@ func TestRelayCLIFlow(t *testing.T) {
 
 	// Continuously read dtfm PTY output to extract credentials and drain output
 	var ptyMu sync.Mutex
+	var ptyOutput bytes.Buffer
+	var parser ptyCredentialParser
 	var magicLink, pairingToken string
 	readyCh := make(chan struct{})
 	var readyOnce sync.Once
 
 	go func() {
 		buf := make([]byte, 64*1024)
-		var pending bytes.Buffer
 		for {
 			n, err := dtfmPTY.Read(buf)
 			if n > 0 {
 				ptyMu.Lock()
-				if magicLink == "" || pairingToken == "" {
-					pending.Write(buf[:n])
-					lines := strings.Split(pending.String(), "\n")
-					if len(lines) > 1 {
-						for i := 0; i < len(lines)-1; i++ {
-							l := lines[i]
-							if strings.Contains(l, "Agent Magic Link:") && i+1 < len(lines) {
-								magicLink = strings.TrimSpace(lines[i+1])
-							}
-							if strings.Contains(l, "Pairing Token:") && i+1 < len(lines) {
-								pairingToken = strings.TrimSpace(lines[i+1])
-							}
-						}
-						pending.Reset()
-						pending.WriteString(lines[len(lines)-1])
+				if remaining := maxCapturedPTYBytes - ptyOutput.Len(); remaining > 0 {
+					toWrite := n
+					if toWrite > remaining {
+						toWrite = remaining
 					}
-					if magicLink != "" && pairingToken != "" {
+					ptyOutput.Write(buf[:toWrite])
+				}
+				if magicLink == "" || pairingToken == "" {
+					if link, token, ready := parser.feed(buf[:n]); ready {
+						magicLink = link
+						pairingToken = token
 						readyOnce.Do(func() {
 							close(readyCh)
 						})
@@ -146,7 +244,10 @@ func TestRelayCLIFlow(t *testing.T) {
 	select {
 	case <-readyCh:
 	case <-time.After(5 * time.Second):
-		t.Fatalf("timed out waiting for dtfm pairing credentials")
+		ptyMu.Lock()
+		captured := ptyOutput.String()
+		ptyMu.Unlock()
+		t.Fatalf("timed out waiting for dtfm pairing credentials; captured output:\n%s", captured)
 	}
 
 	// 4. Test lmdtfy ping over relay using Magic Link URL
