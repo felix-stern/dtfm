@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-21
+
 ### Added
 - Opt-in `--allow-extension-origin` flag in `dtfm-relay` (`cmd/relay`) allowing `chrome-extension://` and `moz-extension://` WebSocket origins ([#42](https://github.com/iinozemtsev-lab/dtfm/issues/42), [#43](https://github.com/iinozemtsev-lab/dtfm/pull/43)).
 - Post-upgrade binary `FrameAuth` (`0x04`) fallback in `dtfm-relay` (`pkg/e2ee`, `cmd/relay`) for browser WebSocket clients that cannot set custom HTTP upgrade headers, preserving full backwards compatibility with header-authenticated CLI clients ([#42](https://github.com/iinozemtsev-lab/dtfm/issues/42), [#43](https://github.com/iinozemtsev-lab/dtfm/pull/43)).
@@ -74,7 +76,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Build Infrastructure**:
   - Multi-platform static compilation targets in `Makefile` (`make cross`) for `darwin-arm64`, `darwin-amd64`, `linux-amd64`, and `linux-arm64` (`CGO_ENABLED=0`).
 
-[Unreleased]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/iinozemtsev-lab/dtfm/compare/v0.2.0...v0.3.0
