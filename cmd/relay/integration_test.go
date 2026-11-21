@@ -107,6 +107,7 @@ func TestEndToEndE2EERelayPingAndExecution(t *testing.T) {
 		t.Fatalf("operator dial error: %v", err)
 	}
 	defer opWsConn.Close()
+	waitForActiveSessions(t, hub, 1, 2*time.Second)
 
 	mockP := &mockPrompter{
 		decision: "approved",
@@ -450,13 +451,7 @@ func TestEndToEndE2EERelayPingAndExecution(t *testing.T) {
 	// 8. Test Operator Disconnect:
 	opWsConn.Close()
 	<-opLoopDoneCh
-	deadline := time.Now().Add(2 * time.Second)
-	for hub.ActiveSessionsCount() != 0 {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for hub to evict disconnected operator session (active=%d)", hub.ActiveSessionsCount())
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	waitForActiveSessions(t, hub, 0, 2*time.Second)
 
 	agentWsURL := relayWsURL + "?session=" + sessionID + "&role=agent"
 	_, _, err = websocket.DefaultDialer.Dial(agentWsURL, agentHeader)
@@ -497,6 +492,7 @@ func TestRelayLargeEscapedExecResp(t *testing.T) {
 	}
 	defer opWsConn.Close()
 	opWsConn.SetReadLimit(6 * 1024 * 1024)
+	waitForActiveSessions(t, hub, 1, 2*time.Second)
 
 	var opCipherMu sync.Mutex
 	var activeOpCipher *e2ee.ConnCipher
@@ -517,6 +513,7 @@ func TestRelayLargeEscapedExecResp(t *testing.T) {
 
 			if ctrl == e2ee.FrameAgentConnected {
 				opCipherMu.Lock()
+				activeOpCipher = nil
 				var opPacket []byte
 				opNonce, opPacket, _ = e2ee.BuildOperatorHandshake(handshakeKey, sessionID)
 				opCipherMu.Unlock()
@@ -637,6 +634,17 @@ func TestRelayLargeEscapedExecResp(t *testing.T) {
 	}
 }
 
+func waitForActiveSessions(t *testing.T, hub *Hub, want int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for hub.ActiveSessionsCount() != want && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := hub.ActiveSessionsCount(); got != want {
+		t.Fatalf("timed out waiting for %d active session(s), got %d", want, got)
+	}
+}
+
 func TestRelayListenerOversizedAgentFrameIsolation(t *testing.T) {
 	hub := NewHub(time.Minute, 100, nil)
 	defer hub.Close()
@@ -667,6 +675,7 @@ func TestRelayListenerOversizedAgentFrameIsolation(t *testing.T) {
 	}
 	defer opWsConn.Close()
 	opWsConn.SetReadLimit(6 * 1024 * 1024)
+	waitForActiveSessions(t, hub, 1, 2*time.Second)
 
 	var opCipherMu sync.Mutex
 	var activeOpCipher *e2ee.ConnCipher
@@ -688,6 +697,7 @@ func TestRelayListenerOversizedAgentFrameIsolation(t *testing.T) {
 
 			if ctrl == e2ee.FrameAgentConnected {
 				opCipherMu.Lock()
+				activeOpCipher = nil
 				var opPacket []byte
 				opNonce, opPacket, _ = e2ee.BuildOperatorHandshake(handshakeKey, sessionID)
 				opCipherMu.Unlock()
@@ -806,10 +816,6 @@ func TestRelayListenerOversizedAgentFrameIsolation(t *testing.T) {
 	}
 	defer agentConn2.Close()
 
-	opCipherMu.Lock()
-	activeOpCipher = nil
-	opCipherMu.Unlock()
-
 	agentNonce2, agentHandshake2, _ := e2ee.BuildAgentHandshake(handshakeKey, sessionID)
 	_ = agentConn2.WriteMessage(websocket.BinaryMessage, agentHandshake2)
 	_, opPacket2, err := agentConn2.ReadMessage()
@@ -890,13 +896,7 @@ func TestMixedModeExtensionOperatorAndHeaderAgentE2EE(t *testing.T) {
 		t.Fatalf("operator FrameAuth write failed: %v", err)
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
-	for hub.ActiveSessionsCount() != 1 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if hub.ActiveSessionsCount() != 1 {
-		t.Fatalf("expected 1 active session, got %d", hub.ActiveSessionsCount())
-	}
+	waitForActiveSessions(t, hub, 1, 2*time.Second)
 
 	// 2. Agent connects using standard X-DTFM-Auth HTTP header
 	agentHeader := make(http.Header)
