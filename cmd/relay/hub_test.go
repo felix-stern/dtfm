@@ -1154,4 +1154,84 @@ func TestHubFrameAuthPerIPAndGlobalCap(t *testing.T) {
 				hub.ActiveSessionsCount(), pending)
 		}
 	})
+
+	t.Run("existing_session_operator_and_agent", func(t *testing.T) {
+		hub := NewHubWithConfig(HubConfig{
+			IdleTimeout:      time.Minute,
+			MaxSessions:      10,
+			MaxSessionsPerIP: 1,
+			ExemptLoopback:   false,
+		})
+		hub.frameAuthTimeout = 100 * time.Millisecond
+		defer hub.Close()
+
+		ts := httptest.NewServer(hub)
+		defer ts.Close()
+		wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws"
+
+		sessionID := "existing-cap-session"
+		rawKey, _, _ := e2ee.GenerateSessionKey()
+		opAuth, agentAuth, agentVerifier, _ := e2ee.DeriveAuthTokens(rawKey, sessionID)
+
+		// Establish 1 active session (at MaxSessionsPerIP=1)
+		opConn, _, err := websocket.DefaultDialer.Dial(wsURL+"?session="+sessionID+"&role=operator", nil)
+		if err != nil {
+			t.Fatalf("initial operator dial failed: %v", err)
+		}
+		defer opConn.Close()
+		if err := opConn.WriteMessage(websocket.BinaryMessage, buildOperatorFrameAuth(t, opAuth, agentVerifier)); err != nil {
+			t.Fatalf("initial operator FrameAuth failed: %v", err)
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for hub.ActiveSessionsCount() != 1 && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+
+		// 1. Stalled operator reconnect on existing session reserves pending slot; 2nd stalled reconnect is rejected 503
+		reconn1, _, err := websocket.DefaultDialer.Dial(wsURL+"?session="+sessionID+"&role=operator", nil)
+		if err != nil {
+			t.Fatalf("first stalled reconnect failed (should be allowed by pending-only cap): %v", err)
+		}
+		defer reconn1.Close()
+
+		_, resp, err := websocket.DefaultDialer.Dial(wsURL+"?session="+sessionID+"&role=operator", nil)
+		if err == nil {
+			t.Fatal("expected second stalled reconnect to be rejected with 503")
+		}
+		if resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 Service Unavailable, got resp=%v err=%v", resp, err)
+		}
+		assertWSCloseCode(t, reconn1, 4003)
+
+		// 2. Stalled agent connect on existing session reserves pending slot; 2nd stalled agent is rejected 503
+		agentProbe1, _, err := websocket.DefaultDialer.Dial(wsURL+"?session="+sessionID+"&role=agent", nil)
+		if err != nil {
+			t.Fatalf("first stalled agent probe failed (should be allowed by pending-only cap): %v", err)
+		}
+		defer agentProbe1.Close()
+
+		_, resp, err = websocket.DefaultDialer.Dial(wsURL+"?session="+sessionID+"&role=agent", nil)
+		if err == nil {
+			t.Fatal("expected second stalled agent probe to be rejected with 503")
+		}
+		if resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 Service Unavailable, got resp=%v err=%v", resp, err)
+		}
+		assertWSCloseCode(t, agentProbe1, 4003)
+
+		// 3. Legitimate agent still pairs cleanly after pending slot is released
+		agentConn, _, err := websocket.DefaultDialer.Dial(wsURL+"?session="+sessionID+"&role=agent", nil)
+		if err != nil {
+			t.Fatalf("legitimate agent dial failed: %v", err)
+		}
+		defer agentConn.Close()
+		if err := agentConn.WriteMessage(websocket.BinaryMessage, buildAgentFrameAuth(t, agentAuth)); err != nil {
+			t.Fatalf("legitimate agent FrameAuth failed: %v", err)
+		}
+		_ = opConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, msg, err := opConn.ReadMessage()
+		if err != nil || len(msg) != 9 || msg[0] != e2ee.FrameAgentConnected {
+			t.Fatalf("expected FrameAgentConnected, got err=%v bytes=%x", err, msg)
+		}
+	})
 }

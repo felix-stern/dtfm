@@ -429,15 +429,26 @@ func (h *Hub) getRemoteIP(r *http.Request) (string, bool) {
 	return peerIP.String(), false
 }
 
-func (h *Hub) isIPRateLimited(ipStr string, fromForwarded bool) bool {
-	if h.maxSessionsPerIP <= 0 {
+func (h *Hub) isLoopbackExempt(ipStr string, fromForwarded bool) bool {
+	if fromForwarded || !h.exemptLoopback {
 		return false
 	}
 	ip := net.ParseIP(ipStr)
-	if !fromForwarded && ip != nil && ip.IsLoopback() && h.exemptLoopback {
+	return ip != nil && ip.IsLoopback()
+}
+
+func (h *Hub) isIPRateLimited(ipStr string, fromForwarded bool) bool {
+	if h.maxSessionsPerIP <= 0 || h.isLoopbackExempt(ipStr, fromForwarded) {
 		return false
 	}
 	return (h.sessionsPerIP[ipStr] + h.pendingAuthPerIP[ipStr]) >= h.maxSessionsPerIP
+}
+
+func (h *Hub) isPendingIPRateLimited(ipStr string, fromForwarded bool) bool {
+	if h.maxSessionsPerIP <= 0 || h.isLoopbackExempt(ipStr, fromForwarded) {
+		return false
+	}
+	return h.pendingAuthPerIP[ipStr] >= h.maxSessionsPerIP
 }
 
 type authCredentials struct {
@@ -528,6 +539,16 @@ func (h *Hub) reservePendingSlot(ip string) func() {
 	}
 }
 
+func (h *Hub) reserveExistingSessionPendingSlot(ip string, fromForwarded bool) (func(), error) {
+	if h.pendingAuth >= h.maxSessions {
+		return nil, errMaxSessions
+	}
+	if h.isPendingIPRateLimited(ip, fromForwarded) {
+		return nil, errMaxSessionsPerIP
+	}
+	return h.reservePendingSlot(ip), nil
+}
+
 func (h *Hub) validatePreUpgrade(r *http.Request, sessionID, role string) (func(), error) {
 	if err := e2ee.ValidateSessionID(sessionID); err != nil {
 		return nil, errInvalidSessionID
@@ -563,7 +584,10 @@ func (h *Hub) validatePreUpgrade(r *http.Request, sessionID, role string) (func(
 		if s.closed {
 			return nil, errSessionNotFound
 		}
-		if useHeaderAuth && s.hasAuth {
+		if !useHeaderAuth {
+			return h.reserveExistingSessionPendingSlot(ip, fromForwarded)
+		}
+		if s.hasAuth {
 			c, err := parseHeaderAuth(r, role)
 			if err != nil {
 				return nil, errUnauthorized
@@ -587,7 +611,10 @@ func (h *Hub) validatePreUpgrade(r *http.Request, sessionID, role string) (func(
 		if s.agent != nil {
 			return nil, errSessionBusy
 		}
-		if useHeaderAuth && s.hasAuth {
+		if !useHeaderAuth {
+			return h.reserveExistingSessionPendingSlot(ip, fromForwarded)
+		}
+		if s.hasAuth {
 			c, err := parseHeaderAuth(r, role)
 			if err != nil {
 				return nil, errUnauthorized
