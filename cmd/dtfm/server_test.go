@@ -447,27 +447,108 @@ func TestQueuedRequestExpiredBeforeReview(t *testing.T) {
 	<-serveDone
 }
 
+type deadlineContext struct {
+	base context.Context
+	done chan struct{}
+	once sync.Once
+	mu   sync.Mutex
+	err  error
+}
+
+func newDeadlineContext(fallback time.Duration) (*deadlineContext, context.CancelFunc) {
+	base, cancel := context.WithTimeout(context.Background(), fallback)
+	dc := &deadlineContext{
+		base: base,
+		done: make(chan struct{}),
+	}
+	go func() {
+		<-base.Done()
+		dc.trigger(base.Err())
+	}()
+	return dc, cancel
+}
+
+func (d *deadlineContext) trigger(err error) {
+	d.once.Do(func() {
+		d.mu.Lock()
+		d.err = err
+		d.mu.Unlock()
+		close(d.done)
+	})
+}
+
+func (d *deadlineContext) Deadline() (time.Time, bool) { return d.base.Deadline() }
+func (d *deadlineContext) Done() <-chan struct{}       { return d.done }
+func (d *deadlineContext) Err() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.err
+}
+func (d *deadlineContext) Value(key any) any { return d.base.Value(key) }
+
+type readyWriter struct {
+	mu      sync.Mutex
+	buf     bytes.Buffer
+	onReady func()
+	fired   bool
+}
+
+func (w *readyWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	w.buf.Write(p)
+	if !w.fired && bytes.Contains(w.buf.Bytes(), []byte("\nREADY\n")) {
+		w.fired = true
+		onReady := w.onReady
+		w.mu.Unlock()
+		onReady()
+		return len(p), nil
+	}
+	w.mu.Unlock()
+	return len(p), nil
+}
+
 func TestSubprocessGrandchildTimeoutGroupKill(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := newDeadlineContext(5 * time.Second)
 	defer cancel()
 
-	executor := NewCommandExecutor(io.Discard, io.Discard)
-	start := time.Now()
+	var killStartMu sync.Mutex
+	var killStart time.Time
+	ready := false
+
+	out := &readyWriter{
+		onReady: func() {
+			killStartMu.Lock()
+			killStart = time.Now()
+			ready = true
+			killStartMu.Unlock()
+			ctx.trigger(context.DeadlineExceeded)
+		},
+	}
+
+	executor := NewCommandExecutor(out, io.Discard)
 	resp := executor.Execute(ctx, ExecOptions{
 		ID:        "subproc-1",
 		Command:   "sh",
-		Args:      []string{"-c", "(sleep 10 &); sleep 2"},
-		StartTime: start,
+		Args:      []string{"-c", "sleep 10 & echo READY; sleep 10"},
+		StartTime: time.Now(),
 	})
 
+	killStartMu.Lock()
+	ks := killStart
+	wasReady := ready
+	killStartMu.Unlock()
+
+	if !wasReady {
+		t.Fatalf("Command did not emit READY before timeout (status=%s, err=%s)", resp.Status, resp.Error)
+	}
 	if resp.Status != protocol.StatusTimeout {
 		t.Fatalf("Expected StatusTimeout, got %s", resp.Status)
 	}
 	if resp.ExitCode != protocol.ExitCodeTimeout {
 		t.Errorf("Expected exit code %d, got %d", protocol.ExitCodeTimeout, resp.ExitCode)
 	}
-	if time.Since(start) > 2*time.Second {
-		t.Errorf("Execution took too long (%v); grandchild process group was not terminated promptly", time.Since(start))
+	if elapsed := time.Since(ks); elapsed >= 2*time.Second {
+		t.Errorf("Execution took too long (%v); grandchild process group was not terminated promptly", elapsed)
 	}
 }
 
