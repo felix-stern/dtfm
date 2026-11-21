@@ -246,6 +246,7 @@ EOF
 | `--max-sessions` | `10000` | Caps total concurrent in-memory sessions (returns HTTP `503` / WS close `4029` when full). |
 | `--max-sessions-per-ip` | `64` | Caps concurrent operator sessions per client IP (returns HTTP `503` / WS close `4029` when exceeded). |
 | `--trusted-proxies` | `127.0.0.0/8,::1/128` | Trusts forwarded client IP headers (`X-Forwarded-For` right-to-left, fallback `X-Real-IP`) only from local Nginx. See Section 3 if using Cloudflare Orange Cloud. |
+| `--allow-extension-origin` | `false` | Opt-in flag allowing `chrome-extension://` and `moz-extension://` WebSocket origins (with non-empty host) for browser extension clients authenticating via post-upgrade `FrameAuth` (`0x04`). |
 | `DynamicUser=yes` | `yes` | Allocates a transient, unprivileged UID/GID dynamically at startup; no persistent user account needed. |
 | `ProtectSystem=strict` | `strict` | Mounts `/usr`, `/boot`, `/etc`, and system directories strictly read-only. |
 | `CapabilityBoundingSet=` | *(empty)* | Drops all POSIX capabilities (no `CAP_NET_BIND_SERVICE`, no `CAP_SYS_ADMIN`, etc.). |

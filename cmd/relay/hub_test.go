@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -225,10 +226,12 @@ func TestHubAuthentication(t *testing.T) {
 	opURL := wsURL + "?session=" + sessionID + "&role=operator"
 	agentURL := wsURL + "?session=" + sessionID + "&role=agent"
 
-	// 1. Operator without headers fails with 403
-	_, resp, err := websocket.DefaultDialer.Dial(opURL, nil)
+	// 1. Operator with invalid header fails with 403
+	badOpHeader := make(http.Header)
+	badOpHeader.Set("X-DTFM-Auth", "not-valid-hex")
+	_, resp, err := websocket.DefaultDialer.Dial(opURL, badOpHeader)
 	if err == nil {
-		t.Fatal("expected unauthenticated operator to fail")
+		t.Fatal("expected invalid header operator to fail")
 	}
 	if resp != nil && resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("expected 403 Forbidden, got %d", resp.StatusCode)
@@ -244,10 +247,20 @@ func TestHubAuthentication(t *testing.T) {
 	}
 	defer opConn.Close()
 
-	// 3. Agent without headers fails with 403
-	_, resp, err = websocket.DefaultDialer.Dial(agentURL, nil)
+	deadline := time.Now().Add(2 * time.Second)
+	for hub.ActiveSessionsCount() != 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if hub.ActiveSessionsCount() != 1 {
+		t.Fatalf("expected 1 active session, got %d", hub.ActiveSessionsCount())
+	}
+
+	// 3. Agent with empty header fails with 403
+	emptyAgentHeader := make(http.Header)
+	emptyAgentHeader.Set("X-DTFM-Auth", "")
+	_, resp, err = websocket.DefaultDialer.Dial(agentURL, emptyAgentHeader)
 	if err == nil {
-		t.Fatal("expected unauthenticated agent to fail")
+		t.Fatal("expected empty-header agent to fail")
 	}
 	if resp != nil && resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("expected 403 Forbidden, got %d", resp.StatusCode)
@@ -644,4 +657,581 @@ func TestHubKickDrainsQueuedData(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected agent connection to close after draining kick")
 	}
+}
+
+func buildOperatorFrameAuth(t *testing.T, opAuthHex, agentVerifierHex string) []byte {
+	t.Helper()
+	opRaw, err := hex.DecodeString(opAuthHex)
+	if err != nil || len(opRaw) != 32 {
+		t.Fatalf("invalid opAuthHex: %v", err)
+	}
+	verRaw, err := hex.DecodeString(agentVerifierHex)
+	if err != nil || len(verRaw) != 32 {
+		t.Fatalf("invalid agentVerifierHex: %v", err)
+	}
+	frame := make([]byte, 65)
+	frame[0] = e2ee.FrameAuth
+	copy(frame[1:33], opRaw)
+	copy(frame[33:65], verRaw)
+	return frame
+}
+
+func buildAgentFrameAuth(t *testing.T, agentAuthHex string) []byte {
+	t.Helper()
+	agentRaw, err := hex.DecodeString(agentAuthHex)
+	if err != nil || len(agentRaw) != 32 {
+		t.Fatalf("invalid agentAuthHex: %v", err)
+	}
+	frame := make([]byte, 33)
+	frame[0] = e2ee.FrameAuth
+	copy(frame[1:33], agentRaw)
+	return frame
+}
+
+func assertWSCloseCode(t *testing.T, conn *websocket.Conn, wantCode int) {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, _, err := conn.ReadMessage()
+	if err == nil {
+		t.Fatalf("expected close code %d, but read succeeded", wantCode)
+	}
+	if !websocket.IsCloseError(err, wantCode) {
+		t.Fatalf("expected WS close code %d, got err: %v", wantCode, err)
+	}
+}
+
+func TestHubExtensionOriginSecurity(t *testing.T) {
+	sessionID := "ext-origin-test"
+	rawKey, _, _ := e2ee.GenerateSessionKey()
+	opAuth, _, agentVerifier, _ := e2ee.DeriveAuthTokens(rawKey, sessionID)
+
+	opHeader := make(http.Header)
+	opHeader.Set("X-DTFM-Auth", opAuth)
+	opHeader.Set("X-DTFM-Agent-Verifier", agentVerifier)
+
+	// 1. Default hub (AllowExtensionOrigin=false) rejects extension origins
+	hubDefault := NewHub(time.Minute, 100, nil)
+	defer hubDefault.Close()
+	tsDefault := httptest.NewServer(hubDefault)
+	defer tsDefault.Close()
+	wsDefault := "ws" + strings.TrimPrefix(tsDefault.URL, "http") + "/ws?session=" + sessionID + "&role=operator"
+
+	for _, origin := range []string{
+		"chrome-extension://abcdefghijklmnop",
+		"moz-extension://1234-5678",
+		"chrome-extension://",
+		"https://evil.example",
+	} {
+		h := opHeader.Clone()
+		h.Set("Origin", origin)
+		_, resp, err := websocket.DefaultDialer.Dial(wsDefault, h)
+		if err == nil {
+			t.Fatalf("expected origin %q to be rejected when AllowExtensionOrigin=false", origin)
+		}
+		if resp == nil || resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("expected 403 for origin %q, got resp=%v err=%v", origin, resp, err)
+		}
+	}
+
+	// 2. Hub with AllowExtensionOrigin=true allows valid chrome-extension/moz-extension origins
+	hubAllow := NewHubWithConfig(HubConfig{
+		IdleTimeout:          time.Minute,
+		MaxSessions:          100,
+		AllowExtensionOrigin: true,
+	})
+	defer hubAllow.Close()
+	tsAllow := httptest.NewServer(hubAllow)
+	defer tsAllow.Close()
+	wsAllow := "ws" + strings.TrimPrefix(tsAllow.URL, "http") + "/ws?session=" + sessionID + "&role=operator"
+
+	for _, origin := range []string{
+		"chrome-extension://abcdefghijklmnop",
+		"CHROME-EXTENSION://abcdefghijklmnop",
+		"moz-extension://1234-5678",
+		"MOZ-EXTENSION://1234-5678",
+	} {
+		h := opHeader.Clone()
+		h.Set("Origin", origin)
+		conn, _, err := websocket.DefaultDialer.Dial(wsAllow, h)
+		if err != nil {
+			t.Fatalf("expected origin %q to be allowed, got error: %v", origin, err)
+		}
+		_ = conn.Close()
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	// 3. Empty host extension origins and arbitrary https origins are still rejected
+	for _, origin := range []string{
+		"chrome-extension://",
+		"moz-extension://",
+		"https://evil.example",
+	} {
+		h := opHeader.Clone()
+		h.Set("Origin", origin)
+		_, resp, err := websocket.DefaultDialer.Dial(wsAllow, h)
+		if err == nil {
+			t.Fatalf("expected origin %q to be rejected even with AllowExtensionOrigin=true", origin)
+		}
+		if resp == nil || resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("expected 403 for origin %q, got resp=%v err=%v", origin, resp, err)
+		}
+	}
+}
+
+func TestHubFrameAuthOperator(t *testing.T) {
+	hub := NewHubWithConfig(HubConfig{
+		IdleTimeout:      time.Minute,
+		MaxSessions:      100,
+		MaxSessionsPerIP: 4,
+		ExemptLoopback:   false,
+	})
+	hub.frameAuthTimeout = 80 * time.Millisecond
+	defer hub.Close()
+
+	ts := httptest.NewServer(hub)
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws"
+	sessionID := "frame-auth-op-test"
+	rawKey, _, _ := e2ee.GenerateSessionKey()
+	opAuth, _, agentVerifier, _ := e2ee.DeriveAuthTokens(rawKey, sessionID)
+	opURL := wsURL + "?session=" + sessionID + "&role=operator"
+
+	// 1. Bad length, bad opcode, text frame, and read timeout -> close 4003 without leaking sessions/IPs
+	badFrames := []struct {
+		name    string
+		msgType int
+		payload []byte
+	}{
+		{"too_short", websocket.BinaryMessage, make([]byte, 64)},
+		{"too_long", websocket.BinaryMessage, make([]byte, 66)},
+		{"agent_len_for_op", websocket.BinaryMessage, make([]byte, 33)},
+		{"wrong_opcode", websocket.BinaryMessage, append([]byte{e2ee.FrameData}, make([]byte, 64)...)},
+		{"text_frame", websocket.TextMessage, buildOperatorFrameAuth(t, opAuth, agentVerifier)},
+	}
+	for _, tc := range badFrames {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _, err := websocket.DefaultDialer.Dial(opURL, nil)
+			if err != nil {
+				t.Fatalf("dial failed: %v", err)
+			}
+			defer c.Close()
+			if err := c.WriteMessage(tc.msgType, tc.payload); err != nil {
+				t.Fatalf("write failed: %v", err)
+			}
+			assertWSCloseCode(t, c, 4003)
+			if hub.ActiveSessionsCount() != 0 {
+				t.Fatalf("expected 0 active sessions, got %d", hub.ActiveSessionsCount())
+			}
+			hub.mu.RLock()
+			ipCount := len(hub.sessionsPerIP)
+			hub.mu.RUnlock()
+			if ipCount != 0 {
+				t.Fatalf("expected 0 sessionsPerIP entries, got %d", ipCount)
+			}
+		})
+	}
+
+	t.Run("timeout", func(t *testing.T) {
+		c, _, err := websocket.DefaultDialer.Dial(opURL, nil)
+		if err != nil {
+			t.Fatalf("dial failed: %v", err)
+		}
+		defer c.Close()
+		assertWSCloseCode(t, c, 4003)
+		if hub.ActiveSessionsCount() != 0 {
+			t.Fatalf("expected 0 active sessions after timeout, got %d", hub.ActiveSessionsCount())
+		}
+	})
+
+	// 2. Valid FrameAuth creates session
+	opConn1, _, err := websocket.DefaultDialer.Dial(opURL, nil)
+	if err != nil {
+		t.Fatalf("operator1 dial failed: %v", err)
+	}
+	defer opConn1.Close()
+
+	if err := opConn1.WriteMessage(websocket.BinaryMessage, buildOperatorFrameAuth(t, opAuth, agentVerifier)); err != nil {
+		t.Fatalf("operator1 FrameAuth write failed: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for hub.ActiveSessionsCount() != 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if hub.ActiveSessionsCount() != 1 {
+		t.Fatalf("expected 1 active session, got %d", hub.ActiveSessionsCount())
+	}
+
+	// 3. Reconnect with mismatched opAuth -> close 4003, original session stays active
+	wrongOpAuth := strings.Repeat("aa", 32)
+	badReconn, _, err := websocket.DefaultDialer.Dial(opURL, nil)
+	if err != nil {
+		t.Fatalf("bad reconnect dial failed: %v", err)
+	}
+	defer badReconn.Close()
+	if err := badReconn.WriteMessage(websocket.BinaryMessage, buildOperatorFrameAuth(t, wrongOpAuth, agentVerifier)); err != nil {
+		t.Fatalf("bad reconnect write failed: %v", err)
+	}
+	assertWSCloseCode(t, badReconn, 4003)
+	if hub.ActiveSessionsCount() != 1 {
+		t.Fatalf("expected original session to remain active, got %d", hub.ActiveSessionsCount())
+	}
+
+	// 4. Reconnect with valid FrameAuth succeeds and displaces prior operator
+	opConn2, _, err := websocket.DefaultDialer.Dial(opURL, nil)
+	if err != nil {
+		t.Fatalf("operator2 dial failed: %v", err)
+	}
+	defer opConn2.Close()
+	if err := opConn2.WriteMessage(websocket.BinaryMessage, buildOperatorFrameAuth(t, opAuth, agentVerifier)); err != nil {
+		t.Fatalf("operator2 FrameAuth write failed: %v", err)
+	}
+
+	_ = opConn1.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, _, err := opConn1.ReadMessage(); err == nil {
+		t.Fatal("expected opConn1 to be displaced by valid reconnect")
+	}
+	if hub.ActiveSessionsCount() != 1 {
+		t.Fatalf("expected 1 active session after reconnect, got %d", hub.ActiveSessionsCount())
+	}
+}
+
+func TestHubFrameAuthAgent(t *testing.T) {
+	hub := NewHub(time.Minute, 100, nil)
+	hub.frameAuthTimeout = 80 * time.Millisecond
+	defer hub.Close()
+
+	ts := httptest.NewServer(hub)
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws"
+	sessionID := "frame-auth-agent-test"
+	rawKey, _, _ := e2ee.GenerateSessionKey()
+	opAuth, agentAuth, agentVerifier, _ := e2ee.DeriveAuthTokens(rawKey, sessionID)
+	opURL := wsURL + "?session=" + sessionID + "&role=operator"
+	agentURL := wsURL + "?session=" + sessionID + "&role=agent"
+
+	// 1. Missing session -> pre-upgrade 404 even without auth headers
+	_, resp, err := websocket.DefaultDialer.Dial(agentURL, nil)
+	if err == nil {
+		t.Fatal("expected agent dial on missing session to fail")
+	}
+	if resp == nil || resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404, got resp=%v err=%v", resp, err)
+	}
+
+	// Connect operator via FrameAuth
+	opConn, _, err := websocket.DefaultDialer.Dial(opURL, nil)
+	if err != nil {
+		t.Fatalf("operator dial failed: %v", err)
+	}
+	defer opConn.Close()
+	if err := opConn.WriteMessage(websocket.BinaryMessage, buildOperatorFrameAuth(t, opAuth, agentVerifier)); err != nil {
+		t.Fatalf("operator FrameAuth write failed: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for hub.ActiveSessionsCount() != 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// 2. Wrong agentAuth -> close 4003
+	wrongAgentAuth := strings.Repeat("bb", 32)
+	badAgent, _, err := websocket.DefaultDialer.Dial(agentURL, nil)
+	if err != nil {
+		t.Fatalf("bad agent dial failed: %v", err)
+	}
+	defer badAgent.Close()
+	if err := badAgent.WriteMessage(websocket.BinaryMessage, buildAgentFrameAuth(t, wrongAgentAuth)); err != nil {
+		t.Fatalf("bad agent write failed: %v", err)
+	}
+	assertWSCloseCode(t, badAgent, 4003)
+
+	// 3. Valid FrameAuth -> pairs cleanly and FrameAuth is not forwarded to operator
+	agentConn, _, err := websocket.DefaultDialer.Dial(agentURL, nil)
+	if err != nil {
+		t.Fatalf("agent dial failed: %v", err)
+	}
+	defer agentConn.Close()
+	if err := agentConn.WriteMessage(websocket.BinaryMessage, buildAgentFrameAuth(t, agentAuth)); err != nil {
+		t.Fatalf("agent FrameAuth write failed: %v", err)
+	}
+
+	_ = opConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	msgType, msg, err := opConn.ReadMessage()
+	if err != nil {
+		t.Fatalf("operator read failed: %v", err)
+	}
+	if msgType != websocket.BinaryMessage || len(msg) != 9 || msg[0] != e2ee.FrameAgentConnected {
+		t.Fatalf("expected FrameAgentConnected (not FrameAuth), got type=%d bytes=%x", msgType, msg)
+	}
+
+	// 4. Busy session -> pre-upgrade 409 even without auth headers
+	_, resp, err = websocket.DefaultDialer.Dial(agentURL, nil)
+	if err == nil {
+		t.Fatal("expected second agent on busy session to fail")
+	}
+	if resp == nil || resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict, got resp=%v err=%v", resp, err)
+	}
+
+	// 5. Malformed, oversized (>128B), text, wrong-opcode, and timed-out agent FrameAuth -> close 4003 without leaks
+	agentConn.Close()
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		hub.mu.RLock()
+		s := hub.sessions[sessionID]
+		hub.mu.RUnlock()
+		if s != nil {
+			s.mu.Lock()
+			busy := s.agent != nil
+			s.mu.Unlock()
+			if !busy {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for agent disconnect")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	oversized := make([]byte, 200)
+	oversized[0] = e2ee.FrameAuth
+
+	badAgentFrames := []struct {
+		name      string
+		msgType   int
+		payload   []byte
+		oversized bool
+	}{
+		{"too_short_32", websocket.BinaryMessage, make([]byte, 32), false},
+		{"too_long_34", websocket.BinaryMessage, make([]byte, 34), false},
+		{"op_len_65", websocket.BinaryMessage, make([]byte, 65), false},
+		{"wrong_opcode", websocket.BinaryMessage, append([]byte{e2ee.FrameData}, make([]byte, 32)...), false},
+		{"text_frame", websocket.TextMessage, buildAgentFrameAuth(t, agentAuth), false},
+		{"oversized_200", websocket.BinaryMessage, oversized, true},
+	}
+	for _, tc := range badAgentFrames {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _, err := websocket.DefaultDialer.Dial(agentURL, nil)
+			if err != nil {
+				t.Fatalf("dial failed: %v", err)
+			}
+			defer c.Close()
+			if err := c.WriteMessage(tc.msgType, tc.payload); err != nil {
+				t.Fatalf("write failed: %v", err)
+			}
+			if tc.oversized {
+				_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+				if _, _, err := c.ReadMessage(); err == nil {
+					t.Fatal("expected oversized FrameAuth to disconnect")
+				}
+			} else {
+				assertWSCloseCode(t, c, 4003)
+			}
+			if hub.ActiveSessionsCount() != 1 {
+				t.Fatalf("expected 1 active session, got %d", hub.ActiveSessionsCount())
+			}
+			hub.mu.RLock()
+			ipCount := len(hub.sessionsPerIP)
+			hub.mu.RUnlock()
+			if ipCount != 1 {
+				t.Fatalf("expected 1 sessionsPerIP entry, got %d", ipCount)
+			}
+		})
+	}
+
+	t.Run("timeout", func(t *testing.T) {
+		c, _, err := websocket.DefaultDialer.Dial(agentURL, nil)
+		if err != nil {
+			t.Fatalf("dial failed: %v", err)
+		}
+		defer c.Close()
+		assertWSCloseCode(t, c, 4003)
+	})
+}
+
+func TestHubFrameAuthPerIPAndGlobalCap(t *testing.T) {
+	t.Run("per_ip_cap", func(t *testing.T) {
+		hub := NewHubWithConfig(HubConfig{
+			IdleTimeout:      time.Minute,
+			MaxSessions:      10,
+			MaxSessionsPerIP: 2,
+			ExemptLoopback:   false,
+		})
+		hub.frameAuthTimeout = 100 * time.Millisecond
+		defer hub.Close()
+
+		ts := httptest.NewServer(hub)
+		defer ts.Close()
+		wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws"
+
+		c1, _, err := websocket.DefaultDialer.Dial(wsURL+"?session=probe-1&role=operator", nil)
+		if err != nil {
+			t.Fatalf("probe-1 dial failed: %v", err)
+		}
+		defer c1.Close()
+
+		c2, _, err := websocket.DefaultDialer.Dial(wsURL+"?session=probe-2&role=operator", nil)
+		if err != nil {
+			t.Fatalf("probe-2 dial failed: %v", err)
+		}
+		defer c2.Close()
+
+		// 3rd stalled FrameAuth connection from same IP must be rejected pre-upgrade with 503
+		_, resp, err := websocket.DefaultDialer.Dial(wsURL+"?session=probe-3&role=operator", nil)
+		if err == nil {
+			t.Fatal("expected probe-3 to be rejected due to pending per-IP cap")
+		}
+		if resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 Service Unavailable, got resp=%v err=%v", resp, err)
+		}
+
+		// Both stalled connections time out with 4003 and release pending slots
+		assertWSCloseCode(t, c1, 4003)
+		assertWSCloseCode(t, c2, 4003)
+
+		hub.mu.RLock()
+		pending := hub.pendingAuth
+		pendingIPs := len(hub.pendingAuthPerIP)
+		sessionsIPs := len(hub.sessionsPerIP)
+		hub.mu.RUnlock()
+		if hub.ActiveSessionsCount() != 0 || pending != 0 || pendingIPs != 0 || sessionsIPs != 0 {
+			t.Fatalf("expected clean counters after timeout, got sessions=%d pending=%d pendingIPs=%d sessionsIPs=%d",
+				hub.ActiveSessionsCount(), pending, pendingIPs, sessionsIPs)
+		}
+
+		// Subsequent connection succeeds
+		c3, _, err := websocket.DefaultDialer.Dial(wsURL+"?session=probe-3&role=operator", nil)
+		if err != nil {
+			t.Fatalf("probe-3 dial after release failed: %v", err)
+		}
+		c3.Close()
+	})
+
+	t.Run("global_cap", func(t *testing.T) {
+		hub := NewHubWithConfig(HubConfig{
+			IdleTimeout:      time.Minute,
+			MaxSessions:      2,
+			MaxSessionsPerIP: 0,
+		})
+		hub.frameAuthTimeout = 100 * time.Millisecond
+		defer hub.Close()
+
+		ts := httptest.NewServer(hub)
+		defer ts.Close()
+		wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws"
+
+		c1, _, err := websocket.DefaultDialer.Dial(wsURL+"?session=gprobe-1&role=operator", nil)
+		if err != nil {
+			t.Fatalf("gprobe-1 dial failed: %v", err)
+		}
+		defer c1.Close()
+
+		c2, _, err := websocket.DefaultDialer.Dial(wsURL+"?session=gprobe-2&role=operator", nil)
+		if err != nil {
+			t.Fatalf("gprobe-2 dial failed: %v", err)
+		}
+		defer c2.Close()
+
+		_, resp, err := websocket.DefaultDialer.Dial(wsURL+"?session=gprobe-3&role=operator", nil)
+		if err == nil {
+			t.Fatal("expected gprobe-3 to be rejected due to pending global cap")
+		}
+		if resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 Service Unavailable, got resp=%v err=%v", resp, err)
+		}
+
+		assertWSCloseCode(t, c1, 4003)
+		assertWSCloseCode(t, c2, 4003)
+
+		hub.mu.RLock()
+		pending := hub.pendingAuth
+		hub.mu.RUnlock()
+		if hub.ActiveSessionsCount() != 0 || pending != 0 {
+			t.Fatalf("expected clean global counters after timeout, got sessions=%d pending=%d",
+				hub.ActiveSessionsCount(), pending)
+		}
+	})
+
+	t.Run("existing_session_operator_and_agent", func(t *testing.T) {
+		hub := NewHubWithConfig(HubConfig{
+			IdleTimeout:      time.Minute,
+			MaxSessions:      10,
+			MaxSessionsPerIP: 1,
+			ExemptLoopback:   false,
+		})
+		hub.frameAuthTimeout = 100 * time.Millisecond
+		defer hub.Close()
+
+		ts := httptest.NewServer(hub)
+		defer ts.Close()
+		wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws"
+
+		sessionID := "existing-cap-session"
+		rawKey, _, _ := e2ee.GenerateSessionKey()
+		opAuth, agentAuth, agentVerifier, _ := e2ee.DeriveAuthTokens(rawKey, sessionID)
+
+		// Establish 1 active session (at MaxSessionsPerIP=1)
+		opConn, _, err := websocket.DefaultDialer.Dial(wsURL+"?session="+sessionID+"&role=operator", nil)
+		if err != nil {
+			t.Fatalf("initial operator dial failed: %v", err)
+		}
+		defer opConn.Close()
+		if err := opConn.WriteMessage(websocket.BinaryMessage, buildOperatorFrameAuth(t, opAuth, agentVerifier)); err != nil {
+			t.Fatalf("initial operator FrameAuth failed: %v", err)
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for hub.ActiveSessionsCount() != 1 && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+
+		// 1. Stalled operator reconnect on existing session reserves pending slot; 2nd stalled reconnect is rejected 503
+		reconn1, _, err := websocket.DefaultDialer.Dial(wsURL+"?session="+sessionID+"&role=operator", nil)
+		if err != nil {
+			t.Fatalf("first stalled reconnect failed (should be allowed by pending-only cap): %v", err)
+		}
+		defer reconn1.Close()
+
+		_, resp, err := websocket.DefaultDialer.Dial(wsURL+"?session="+sessionID+"&role=operator", nil)
+		if err == nil {
+			t.Fatal("expected second stalled reconnect to be rejected with 503")
+		}
+		if resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 Service Unavailable, got resp=%v err=%v", resp, err)
+		}
+		assertWSCloseCode(t, reconn1, 4003)
+
+		// 2. Stalled agent connect on existing session reserves pending slot; 2nd stalled agent is rejected 503
+		agentProbe1, _, err := websocket.DefaultDialer.Dial(wsURL+"?session="+sessionID+"&role=agent", nil)
+		if err != nil {
+			t.Fatalf("first stalled agent probe failed (should be allowed by pending-only cap): %v", err)
+		}
+		defer agentProbe1.Close()
+
+		_, resp, err = websocket.DefaultDialer.Dial(wsURL+"?session="+sessionID+"&role=agent", nil)
+		if err == nil {
+			t.Fatal("expected second stalled agent probe to be rejected with 503")
+		}
+		if resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 Service Unavailable, got resp=%v err=%v", resp, err)
+		}
+		assertWSCloseCode(t, agentProbe1, 4003)
+
+		// 3. Legitimate agent still pairs cleanly after pending slot is released
+		agentConn, _, err := websocket.DefaultDialer.Dial(wsURL+"?session="+sessionID+"&role=agent", nil)
+		if err != nil {
+			t.Fatalf("legitimate agent dial failed: %v", err)
+		}
+		defer agentConn.Close()
+		if err := agentConn.WriteMessage(websocket.BinaryMessage, buildAgentFrameAuth(t, agentAuth)); err != nil {
+			t.Fatalf("legitimate agent FrameAuth failed: %v", err)
+		}
+		_ = opConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, msg, err := opConn.ReadMessage()
+		if err != nil || len(msg) != 9 || msg[0] != e2ee.FrameAgentConnected {
+			t.Fatalf("expected FrameAgentConnected, got err=%v bytes=%x", err, msg)
+		}
+	})
 }

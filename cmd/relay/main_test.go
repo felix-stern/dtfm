@@ -20,6 +20,9 @@ func TestRelayCLIFlags(t *testing.T) {
 	if !strings.Contains(stdout.String(), "Usage:") {
 		t.Fatalf("expected usage in stdout, got %q", stdout.String())
 	}
+	if !strings.Contains(stdout.String(), "--allow-extension-origin") {
+		t.Fatalf("expected --allow-extension-origin in usage, got %q", stdout.String())
+	}
 
 	// 2. -v exits 0 and prints version
 	stdout.Reset()

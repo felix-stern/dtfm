@@ -45,6 +45,7 @@ Options:
   --max-sessions <count>     Maximum concurrent in-memory sessions (default: 10000)
   --max-sessions-per-ip <n>  Maximum concurrent sessions per IP (default: 64, 0 = disabled)
   --trusted-proxies <cidrs>  Comma-separated list of trusted proxy CIDRs/IPs (default: 127.0.0.0/8,::1/128)
+  --allow-extension-origin   Allow browser extension WebSocket origins (chrome-extension://, moz-extension://)
   --verbose                  Enable verbose operational logging
   -v, --version              Display version and exit
   -h, --help                 Display help and exit
@@ -64,6 +65,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	maxSessions := fs.Int("max-sessions", defaultMaxSessions, "Maximum concurrent sessions")
 	maxSessionsPerIP := fs.Int("max-sessions-per-ip", defaultMaxSessionsPerIP, "Maximum concurrent sessions per IP (0 = disabled)")
 	trustedProxiesStr := fs.String("trusted-proxies", "127.0.0.0/8,::1/128", "Comma-separated list of trusted proxy CIDRs/IPs for forwarded headers")
+	allowExtensionOrigin := fs.Bool("allow-extension-origin", false, "Allow chrome-extension:// and moz-extension:// WebSocket origins")
 	verbose := fs.Bool("verbose", false, "Enable verbose operational logging")
 	showVersion := fs.Bool("version", false, "Display version and exit")
 	showVersionShort := fs.Bool("v", false, "Display version and exit")
@@ -117,12 +119,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	hub := NewHubWithConfig(HubConfig{
-		IdleTimeout:      *idleTimeout,
-		MaxSessions:      *maxSessions,
-		MaxSessionsPerIP: *maxSessionsPerIP,
-		TrustedProxies:   trustedProxies,
-		ExemptLoopback:   !explicitMaxPerIP,
-		LogWriter:        logWriter,
+		IdleTimeout:          *idleTimeout,
+		MaxSessions:          *maxSessions,
+		MaxSessionsPerIP:     *maxSessionsPerIP,
+		TrustedProxies:       trustedProxies,
+		ExemptLoopback:       !explicitMaxPerIP,
+		AllowExtensionOrigin: *allowExtensionOrigin,
+		LogWriter:            logWriter,
 	})
 	defer hub.Close()
 
