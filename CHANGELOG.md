@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Re-sweep the child process group on `SIGKILL` cancellation in `cmd/dtfm` to close a macOS XNU `fork()`/`killpg()` race where a freshly forked grandchild could survive and stall `cmd.Wait()` until `WaitDelay` ([#52](https://github.com/iinozemtsev-lab/dtfm/issues/52)).
 - Refresh `dtfm-relay` WebSocket read deadline on incoming binary frames (including browser extension keepalives) so active sessions are not dropped if an RFC 6455 Pong is delayed ([#50](https://github.com/iinozemtsev-lab/dtfm/issues/50)).
 
 ## [0.5.0] - 2026-11-21

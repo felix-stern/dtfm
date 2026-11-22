@@ -529,7 +529,7 @@ func TestSubprocessGrandchildTimeoutGroupKill(t *testing.T) {
 	resp := executor.Execute(ctx, ExecOptions{
 		ID:        "subproc-1",
 		Command:   "sh",
-		Args:      []string{"-c", "sleep 10 & echo READY; sleep 10"},
+		Args:      []string{"-c", "sleep 10 & echo READY; wait"},
 		StartTime: time.Now(),
 	})
 

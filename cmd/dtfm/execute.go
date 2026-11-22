@@ -103,14 +103,29 @@ func (e *CommandExecutor) SetActiveChild(pid int) {
 	e.mu.Unlock()
 }
 
+// killProcessGroup sends SIGKILL to the process group and leader, then briefly
+// re-sweeps to catch any grandchild that completed fork() concurrently with the
+// initial killpg() (an XNU race where a newly forked child joins the group
+// after killpg1() has already scanned pg_members).
+func killProcessGroup(pid int) {
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	for i := 0; i < 5; i++ {
+		if err := syscall.Kill(-pid, 0); errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+	}
+}
+
 func (e *CommandExecutor) KillActiveChild() {
 	e.mu.Lock()
 	pid := e.activePid
 	e.mu.Unlock()
 
 	if pid > 0 {
-		_ = syscall.Kill(-pid, syscall.SIGKILL)
-		_ = syscall.Kill(pid, syscall.SIGKILL)
+		killProcessGroup(pid)
 	}
 }
 
@@ -261,8 +276,7 @@ func (e *CommandExecutor) Execute(ctx context.Context, opts ExecOptions) protoco
 
 	cmd.Cancel = func() error {
 		if cmd.Process != nil && cmd.Process.Pid > 0 {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-			_ = syscall.Kill(cmd.Process.Pid, syscall.SIGKILL)
+			killProcessGroup(cmd.Process.Pid)
 		}
 		return nil
 	}
