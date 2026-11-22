@@ -203,6 +203,8 @@ type Hub struct {
 	trustedProxies   []*net.IPNet
 	exemptLoopback   bool
 	frameAuthTimeout time.Duration
+	pongWait         time.Duration
+	pingPeriod       time.Duration
 	upgrader         websocket.Upgrader
 	ctx              context.Context
 	cancel           context.CancelFunc
@@ -235,6 +237,8 @@ func NewHubWithConfig(cfg HubConfig) *Hub {
 		trustedProxies:   trusted,
 		exemptLoopback:   cfg.ExemptLoopback,
 		frameAuthTimeout: defaultFrameAuthTimeout,
+		pongWait:         pongWait,
+		pingPeriod:       pingPeriod,
 		ctx:              ctx,
 		cancel:           cancel,
 		logWriter:        cfg.LogWriter,
@@ -889,6 +893,20 @@ func (h *Hub) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	client.readPump()
 }
 
+func (h *Hub) readDeadline() time.Duration {
+	if h != nil && h.pongWait > 0 {
+		return h.pongWait
+	}
+	return pongWait
+}
+
+func (h *Hub) pingInterval() time.Duration {
+	if h != nil && h.pingPeriod > 0 {
+		return h.pingPeriod
+	}
+	return pingPeriod
+}
+
 func (c *Client) readPump() {
 	defer func() {
 		c.hub.Unregister(c)
@@ -899,9 +917,9 @@ func (c *Client) readPump() {
 	} else {
 		c.conn.SetReadLimit(defaultMaxAgentMessageSize)
 	}
-	_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	_ = c.conn.SetReadDeadline(time.Now().Add(c.hub.readDeadline()))
 	c.conn.SetPongHandler(func(string) error {
-		_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		_ = c.conn.SetReadDeadline(time.Now().Add(c.hub.readDeadline()))
 		c.session.mu.Lock()
 		c.session.lastActive = time.Now()
 		c.session.mu.Unlock()
@@ -920,6 +938,8 @@ func (c *Client) readPump() {
 		if messageType != websocket.BinaryMessage {
 			continue
 		}
+
+		_ = c.conn.SetReadDeadline(time.Now().Add(c.hub.readDeadline()))
 
 		c.session.mu.Lock()
 		c.session.lastActive = time.Now()
@@ -962,7 +982,7 @@ func (c *Client) readPump() {
 }
 
 func (c *Client) writePump() {
-	ticker := time.NewTicker(pingPeriod)
+	ticker := time.NewTicker(c.hub.pingInterval())
 	defer func() {
 		ticker.Stop()
 		c.Close()
