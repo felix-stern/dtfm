@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Refresh `dtfm-relay` WebSocket read deadline on incoming binary frames (including browser extension keepalives) so active sessions are not dropped if an RFC 6455 Pong is delayed ([#50](https://github.com/iinozemtsev-lab/dtfm/issues/50)).
+
 ## [0.5.0] - 2026-11-21
 
 ### Added

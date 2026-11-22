@@ -1235,3 +1235,67 @@ func TestHubFrameAuthPerIPAndGlobalCap(t *testing.T) {
 		}
 	})
 }
+
+func TestHubBinaryKeepaliveRefreshesReadDeadline(t *testing.T) {
+	hub := NewHub(time.Minute, 100, nil)
+	hub.pongWait = 120 * time.Millisecond
+	hub.pingPeriod = time.Hour // Disable server Pings so no RFC 6455 Pong is ever sent.
+	defer hub.Close()
+
+	ts := httptest.NewServer(hub)
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws"
+	sessionID := "binary-keepalive-session"
+	rawKey, _, _ := e2ee.GenerateSessionKey()
+	opAuth, agentAuth, agentVerifier, err := e2ee.DeriveAuthTokens(rawKey, sessionID)
+	if err != nil {
+		t.Fatalf("DeriveAuthTokens failed: %v", err)
+	}
+
+	opHeader := make(http.Header)
+	opHeader.Set("X-DTFM-Auth", opAuth)
+	opHeader.Set("X-DTFM-Agent-Verifier", agentVerifier)
+
+	opConn, _, err := websocket.DefaultDialer.Dial(wsURL+"?session="+sessionID+"&role=operator", opHeader)
+	if err != nil {
+		t.Fatalf("operator dial failed: %v", err)
+	}
+	defer opConn.Close()
+	opConn.SetPingHandler(func(string) error { return nil })
+
+	deadline := time.Now().Add(2 * time.Second)
+	for hub.ActiveSessionsCount() != 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if hub.ActiveSessionsCount() != 1 {
+		t.Fatalf("expected 1 active session, got %d", hub.ActiveSessionsCount())
+	}
+
+	// Send 1-byte binary keepalive frames (0x00) across >2.5x the pongWait window without any Pong.
+	for i := 0; i < 8; i++ {
+		time.Sleep(35 * time.Millisecond)
+		if err := opConn.WriteMessage(websocket.BinaryMessage, []byte{0x00}); err != nil {
+			t.Fatalf("binary keepalive %d write failed: %v", i, err)
+		}
+	}
+
+	if hub.ActiveSessionsCount() != 1 {
+		t.Fatalf("expected operator session to stay alive across pongWait via binary keepalives, got %d sessions", hub.ActiveSessionsCount())
+	}
+
+	// Verify the operator connection is still functional by pairing an agent.
+	agentHeader := make(http.Header)
+	agentHeader.Set("X-DTFM-Auth", agentAuth)
+	agentConn, _, err := websocket.DefaultDialer.Dial(wsURL+"?session="+sessionID+"&role=agent", agentHeader)
+	if err != nil {
+		t.Fatalf("agent dial failed: %v", err)
+	}
+	defer agentConn.Close()
+
+	_ = opConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, msg, err := opConn.ReadMessage()
+	if err != nil || len(msg) != 9 || msg[0] != e2ee.FrameAgentConnected {
+		t.Fatalf("expected FrameAgentConnected after keepalives, got err=%v bytes=%x", err, msg)
+	}
+}
